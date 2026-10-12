@@ -157,6 +157,48 @@ test("missing completion is replayed once, including expired-cursor overlaps", a
   assert.equal(f.sends(), 1);
 });
 
+test("permanently pending recovery stays single-outstanding and does not flood warnings", async (t) => {
+  const f = fixture(t);
+  await f.runtime.sendUserPromptOnLive(f.live, "prompt", true);
+  f.runtime.handleSessionEvent(f.live, event("assistant.turn_start", "start", { turnId: "0" }));
+  let reads = 0;
+  f.live.session.rpc.eventLog.read = () => {
+    reads += 1;
+    return new Promise(() => {});
+  };
+  f.advance(10_000);
+  void f.runtime.recoverSilentSessions();
+  for (let second = 0; second < 350; second += 10) {
+    f.advance(10_000);
+    await f.runtime.recoverSilentSessions();
+  }
+  assert.equal(reads, 1);
+  assert.equal(f.emitted.filter((entry) => entry.type === "member.stalled").length, 2);
+  assert.equal(f.live.recoveringEvents, true);
+  assert.equal(f.live.foregroundBusy, true);
+  assert.equal(f.sends(), 1);
+});
+
+test("healthy long-running tool progress neither warns nor synthesizes completion", async (t) => {
+  const f = fixture(t);
+  await f.runtime.sendUserPromptOnLive(f.live, "prompt", true);
+  f.runtime.handleSessionEvent(f.live, event("assistant.turn_start", "start", { turnId: "0" }));
+  f.runtime.handleSessionEvent(f.live, event("tool.execution_start", "tool", {
+    toolCallId: "tool", toolName: "powershell",
+  }));
+  for (let minute = 0; minute < 10; minute += 1) {
+    f.advance(59_000);
+    f.runtime.handleSessionEvent(f.live, event("tool.execution_progress", `progress-${minute}`, {
+      toolCallId: "tool", progressMessage: "Still running",
+    }));
+    await f.runtime.recoverSilentSessions();
+  }
+  assert.equal(f.emitted.some((entry) => entry.type === "member.stalled"), false);
+  assert.equal(f.emitted.some((entry) => entry.type === "member.foreground_idle"), false);
+  assert.equal(f.live.foregroundBusy, true);
+  assert.equal(f.sends(), 1);
+});
+
 test("failed recovery records metadata, surfaces its error, and remains retryable", async (t) => {
   const f = fixture(t);
   f.live.busy = true;
@@ -226,16 +268,26 @@ test("foreground response after steering does not warn merely because background
   assert.equal(f.emitted.some((e) => e.type === "member.stalled"), false);
 });
 
-test("stale lifecycle cannot replay a late recovery response", async (t) => {
+test("late recovery after a warning cannot mutate a replacement connection and turn", async (t) => {
   const f = fixture(t);
   let finish;
   f.live.session.rpc.eventLog.read = () => new Promise((resolve) => { finish = resolve; });
   const pending = f.runtime.recoverSilentSession(f.live);
-  f.runtime.live.clear();
+  f.health.sendStarted("old-request");
+  f.advance(60_000);
+  assert.ok(f.health.check(true));
+  const replacement = {
+    ...f.live, generation: 2, recoveryCursor: "replacement-tail",
+    busy: true, foregroundBusy: true, foregroundTurnId: "new-turn",
+  };
+  f.runtime.live.set(f.live.target, replacement);
   finish({ events: [event("session.idle", "idle")], cursor: "next", hasMore: false });
   await pending;
   assert.equal(f.emitted.length, 0);
   assert.equal(f.live.recoveryCursor, "initial-tail");
+  assert.equal(replacement.recoveryCursor, "replacement-tail");
+  assert.equal(replacement.foregroundBusy, true);
+  assert.equal(replacement.foregroundTurnId, "new-turn");
 });
 
 test("warnings are rate limited, ignore idle sessions, and survive heartbeat traffic", () => {

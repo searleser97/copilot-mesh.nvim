@@ -268,6 +268,10 @@ inputs cannot be reconstructed are denied closed. Permission and MCP-auth callba
 the exact agent generation and SDK session that created them; lifecycle transitions synchronously
 invalidate old callbacks and reject their pending requests before disconnect begins.
 Recovery uses bounded event-log pages rather than repeatedly downloading the entire conversation.
+Each pass reads at most five pages of 200 events, with one outstanding recovery per session.
+This bounds event count, not bytes; an individual tool result can still be large. A hung RPC
+does not start replacement recovery requests. SDK cursors preserve append order, but ephemeral
+events pruned by the SDK cannot be recovered indefinitely.
 After 60 seconds without foreground progress, Neovim displays a warning; a silent or hung recovery
 RPC cannot suppress that warning. Silence is not proof of failure: the host does not cancel,
 restart, mark idle, or resend an accepted prompt. Normal SDK activity clears the warning.
@@ -276,6 +280,9 @@ IDs, prompt acceptance IDs, lifecycle/tool boundaries, upstream error tracing ID
 phase/timing. They exclude prompt text, tool arguments/results, reasoning, and raw error messages.
 Repeated warnings are limited to once every five minutes. Use these records when reporting a
 stall; error-only SDK logs alone cannot distinguish a model/network wait from lost host events.
+`:NativeCopilotAbort` requests cancellation of the selected foreground turn without resending it.
+Cancellation still requires a responsive SDK transport; an earlier unacknowledged UI command can
+also delay it because host commands are serialized.
 
 Commands mirror the primary mappings:
 
