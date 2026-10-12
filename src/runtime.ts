@@ -19,6 +19,7 @@ import {
 import { z } from "zod";
 import { AgentDatabase } from "./database.js";
 import { SessionHealth } from "./session-health.js";
+import { SessionEventOrder } from "./session-event-order.js";
 import type { AgentAdministration, PrimaryStartupClaim } from "./database.js";
 import {
   CALLER_SELECTOR,
@@ -249,6 +250,8 @@ interface LiveSession {
   recoveringEvents: boolean;
   health: SessionHealth;
   recoveryCursor: string | undefined;
+  eventOrder: SessionEventOrder;
+  recoveryOrderingWarning: boolean;
   recoveryPermissionRequests: Map<string, PermissionRequest>;
   idleCycle: number;
   mailboxDrainCycle: number;
@@ -283,6 +286,8 @@ interface SessionHandlerBinding {
 
 interface SessionContinuity {
   seenEventIds: Set<string>;
+  eventOrder: SessionEventOrder;
+  recoveryCursor: string | undefined;
   modelId: string | undefined;
   aicUsed: number;
   busy: boolean;
@@ -1967,6 +1972,8 @@ export class CopilotRuntime implements RuntimeAdapter {
   private captureContinuity(live: LiveSession): SessionContinuity {
     return {
       seenEventIds: new Set(live.seenEventIds),
+      eventOrder: live.eventOrder.copy(),
+      recoveryCursor: live.recoveryCursor,
       modelId: live.modelId,
       aicUsed: live.aicUsed,
       busy: live.busy,
@@ -2584,7 +2591,7 @@ export class CopilotRuntime implements RuntimeAdapter {
       if (
         this.agentGenerations.get(live.agentId) === live.generation
         && !this.transitions.has(live.agentId)
-        && (live.busy || live.health.waiting)
+        && (live.busy || live.health.waiting || live.eventOrder.pending > 0)
         && !live.recoveringEvents
         && live.health.progressSilenceMs >= 10_000
         && now - live.lastRecoveryAt >= 10_000
@@ -2600,22 +2607,42 @@ export class CopilotRuntime implements RuntimeAdapter {
     live.recoveringEvents = true;
     live.health.recovery("events");
     try {
+      const drain = () => live.eventOrder.drain(
+        live.seenEventIds,
+        (event, historical) => this.handleSessionEvent(live, event, historical),
+        (cursor) => { live.recoveryCursor = cursor; },
+      );
+      drain();
       // Bound each recovery pass; never reload a long-lived session's entire transcript.
       for (let pageNumber = 0; pageNumber < 5; pageNumber += 1) {
-        const page = await live.session.rpc.eventLog.read({
-          ...(live.recoveryCursor === undefined ? {} : { cursor: live.recoveryCursor }),
-          max: 200,
-        });
-        if (!this.liveConnectionCurrent(live, false)) return;
-        for (const event of page.events) {
-          this.handleSessionEvent(live, event);
-        }
-        live.recoveryCursor = page.cursor;
-        if (!page.hasMore) break;
-        if (pageNumber === 4) {
-          live.health.recovery("paused");
+        const capacity = 1000 - live.eventOrder.pending;
+        if (capacity === 0) {
+          this.warnRecoveryOrdering(live);
           return;
         }
+        const cursor = live.eventOrder.readCursor(live.recoveryCursor);
+        const page = await live.session.rpc.eventLog.read({
+          ...(cursor === undefined ? {} : { cursor }),
+          max: Math.min(200, capacity),
+        });
+        if (!this.liveConnectionCurrent(live, false)) return;
+        live.eventOrder.enqueue(page.events, page.cursor, page.cursorStatus === "expired");
+        drain();
+        if (!page.hasMore) break;
+        if (pageNumber === 4) {
+          if (live.eventOrder.pending) this.warnRecoveryOrdering(live);
+          else live.health.recovery("paused");
+          return;
+        }
+      }
+      if (live.eventOrder.pending) {
+        this.warnRecoveryOrdering(live);
+        return;
+      }
+      if (live.recoveryOrderingWarning) {
+        live.recoveryOrderingWarning = false;
+        this.emit("member.recovery_resumed", { message: "Recovered event ordering is established." },
+          { runId: live.runId, memberId: live.target, target: "activity" });
       }
 
       live.health.recovery("permissions");
@@ -2743,6 +2770,18 @@ export class CopilotRuntime implements RuntimeAdapter {
     } finally {
       live.recoveringEvents = false;
     }
+  }
+
+  private warnRecoveryOrdering(live: LiveSession): void {
+    live.health.recovery("ordering_blocked");
+    if (live.recoveryOrderingWarning) return;
+    live.recoveryOrderingWarning = true;
+    this.emit("member.recovery_warning", {
+      message: "Some recovered Copilot events cannot yet be ordered against current activity. " +
+        "They are retained without changing the active turn; streaming continues. " +
+        "Automatic recovery pauses at 1000 retained events rather than dropping them.",
+      pendingEvents: live.eventOrder.pending,
+    }, { runId: live.runId, memberId: live.target, target: "activity" });
   }
 
   private baseSessionConfig(): SessionConfig {
@@ -4725,7 +4764,9 @@ export class CopilotRuntime implements RuntimeAdapter {
             ...entry,
           }) + "\n");
         }),
-        recoveryCursor: undefined,
+        recoveryCursor: continuity?.recoveryCursor,
+        eventOrder: continuity?.eventOrder ?? new SessionEventOrder(),
+        recoveryOrderingWarning: false,
         recoveryPermissionRequests: new Map(),
         idleCycle: continuity?.idleCycle ?? 1,
         mailboxDrainCycle: continuity?.mailboxDrainCycle ?? 0,
@@ -4737,11 +4778,13 @@ export class CopilotRuntime implements RuntimeAdapter {
       live.unsubscribe = session.on((event) => this.handleSessionEvent(live!, event));
       progress("history", "Loading conversation history");
       // Capture before history, so events arriving during the load remain recoverable.
-      live.recoveryCursor = (await session.rpc.eventLog.tail()).cursor;
+      const historyTail = await session.rpc.eventLog.tail();
+      live.recoveryCursor ??= historyTail.cursor;
       this.assertLiveMatchesRequest(live, request);
       const history = await session.getEvents();
       this.assertLiveMatchesRequest(live, request);
       const durableHistory = history.filter((event) => event.ephemeral !== true);
+      live.eventOrder.recordHistory(history);
       for (const event of durableHistory) {
         if (event.type === "permission.requested" && event.data.resolvedByHook !== true) {
           live.recoveryPermissionRequests.set(event.data.requestId, event.data.permissionRequest);
@@ -4767,9 +4810,7 @@ export class CopilotRuntime implements RuntimeAdapter {
         continuity === undefined
           ? durableHistory
           : stateReplayEvents;
-      for (const event of stateReplayEvents) {
-        this.applyReplayedSessionState(live, event);
-      }
+      this.applyOrderedHistoryState(live, stateReplayEvents);
       for (const event of history) {
         live.seenEventIds.add(event.id);
       }
@@ -4922,6 +4963,15 @@ export class CopilotRuntime implements RuntimeAdapter {
     });
   }
 
+  private applyUsage(
+    live: LiveSession,
+    event: Extract<SessionEvent, { type: "assistant.usage" }>,
+    updateModel = true,
+  ): void {
+    if (updateModel) live.modelId = event.data.model || live.modelId;
+    live.aicUsed += (event.data.copilotUsage?.totalNanoAiu ?? 0) / 1_000_000_000;
+  }
+
   private applyReplayedSessionState(live: LiveSession, event: SessionEvent): void {
     switch (event.type) {
       case "assistant.message":
@@ -4938,8 +4988,7 @@ export class CopilotRuntime implements RuntimeAdapter {
         }
         break;
       case "assistant.usage":
-        live.modelId = event.data.model || live.modelId;
-        live.aicUsed += (event.data.copilotUsage?.totalNanoAiu ?? 0) / 1_000_000_000;
+        this.applyUsage(live, event);
         break;
       case "assistant.turn_start":
         if (event.agentId === undefined) {
@@ -4987,10 +5036,28 @@ export class CopilotRuntime implements RuntimeAdapter {
     }
   }
 
-  private handleSessionEvent(live: LiveSession, event: SessionEvent): void {
+  private applyOrderedHistoryState(live: LiveSession, events: readonly SessionEvent[]): void {
+    for (const event of events) {
+      const relation = live.eventOrder.relation(event.id);
+      if (event.type === "assistant.usage") {
+        this.applyUsage(live, event, relation === "after" || relation === "same");
+        continue;
+      }
+      if (relation === "unknown") this.warnRecoveryOrdering(live);
+      else if (relation !== "before") {
+        this.applyReplayedSessionState(live, event);
+        live.eventOrder.advance(event);
+      }
+    }
+  }
+
+  private handleSessionEvent(
+    live: LiveSession, event: SessionEvent, historical = false,
+  ): void {
     if (!this.liveConnectionCurrent(live, true)) {
       return;
     }
+    live.eventOrder.record(event);
     if (live.seenEventIds.has(event.id)) {
       return;
     }
@@ -5001,6 +5068,19 @@ export class CopilotRuntime implements RuntimeAdapter {
     } else if (event.type === "permission.completed") {
       live.recoveryPermissionRequests.delete(event.data.requestId);
     }
+    if (historical) {
+      if (event.type === "assistant.usage") {
+        this.applyUsage(live, event, false);
+        this.emit("session.metrics", { modelId: live.modelId, aicUsed: live.aicUsed },
+          { runId: live.runId, memberId: live.target, target: "status", done: true });
+      }
+      this.emit("recovery.historical_event", {
+        eventId: event.id, eventType: event.type, timestamp: event.timestamp,
+        parentId: event.parentId, agentId: event.agentId, data: event.data,
+      }, { runId: live.runId, memberId: live.target, target: "activity", done: true });
+      return;
+    }
+    live.eventOrder.advance(event);
     if (live.health.event(event)) {
       this.emit(
         "member.progress",
@@ -5125,8 +5205,7 @@ export class CopilotRuntime implements RuntimeAdapter {
         });
         break;
       case "assistant.usage":
-        live.modelId = event.data.model || live.modelId;
-        live.aicUsed += (event.data.copilotUsage?.totalNanoAiu ?? 0) / 1_000_000_000;
+        this.applyUsage(live, event);
         this.emit(
           "session.metrics",
           { modelId: live.modelId, aicUsed: live.aicUsed },

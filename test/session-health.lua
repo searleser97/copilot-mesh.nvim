@@ -31,9 +31,33 @@ emit('member.progress', { message = 'Copilot activity resumed.' })
 assert(member.health_warning == nil)
 assert(not status_text():find('No progress; request still pending.', 1, true))
 assert(member.state == 'busy', 'resumed progress is not turn completion')
+emit('conversation.delta', { messageId = 'new-reply', content = 'New response ' })
+local conversation = member.views.conversation
+local active_message = conversation.active_message
+local awaiting_response = conversation.awaiting_response
+for _, kind in ipairs({ 'session.idle', 'assistant.turn_end', 'session.error', 'assistant.message', 'tool.execution_complete' }) do
+  emit('recovery.historical_event', {
+    eventId = 'old-' .. kind, eventType = kind,
+    data = { content = 'Recovered old text', message = 'Recovered old error', turnId = 'turn' },
+  })
+  assert(member.state == 'busy', 'historical event must not change current UI state')
+  assert(conversation.active_message == active_message, 'historical event must not complete current output')
+  assert(conversation.awaiting_response == awaiting_response)
+end
+emit('member.recovery_warning', { message = 'Recovery ordering is unresolved.' })
+assert(member.state == 'busy')
+assert(status_text():find('Recovery ordering is unresolved.', 1, true))
+emit('member.recovery_resumed', { message = 'Ordering established.' })
+assert(not status_text():find('Recovery ordering is unresolved.', 1, true))
+emit('conversation.delta', { messageId = 'new-reply', content = 'continues.' })
+assert(conversation.active_message == active_message)
 emit('member.error', { message = 'SDK error' })
 assert(member.state == 'error')
 emit('member.state', { state = 'idle' })
 assert(member.state == 'idle')
+emit('recovery.historical_event', {
+  eventId = 'older-error-after-completion', eventType = 'session.error', data = { message = 'Old error' },
+})
+assert(member.state == 'idle', 'historical error must not reopen a completed turn')
 print('PASS stalled/resumed/error/completion UI state')
 vim.cmd('qa!')

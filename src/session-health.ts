@@ -97,7 +97,7 @@ export class SessionHealth {
     return resumed;
   }
 
-  recovery(phase: "events" | "permissions" | "paused" | "complete" | "failed"): void {
+  recovery(phase: "events" | "permissions" | "paused" | "complete" | "failed" | "ordering_blocked"): void {
     if (phase === "events") {
       this.recoveryStartedAt = this.now();
       this.recoveryEndedAt = undefined;

@@ -272,6 +272,13 @@ Each pass reads at most five pages of 200 events, with one outstanding recovery 
 This bounds event count, not bytes; an individual tool result can still be large. A hung RPC
 does not start replacement recovery requests. SDK cursors preserve append order, but ephemeral
 events pruned by the SDK cannot be recovered indefinitely.
+Recovered events are ordered using SDK event IDs, parent links and ordered pages, not timestamps
+or turn numbers (which can repeat). Earlier output/errors are shown as **Recovered earlier**
+entries in Activity without changing the current response, busy state or idle-triggered delivery.
+If cursor expiry or missing ancestry prevents ordering, recovery warns and retains up to 1000
+unreconciled events without advancing its committed cursor. At that limit it pauses reading;
+live streaming remains active. A later ordering anchor can unblock recovery. This is a
+conservative recovery limitation, not permission to assume completion or resend a prompt.
 After 60 seconds without foreground progress, Neovim displays a warning; a silent or hung recovery
 RPC cannot suppress that warning. Silence is not proof of failure: the host does not cancel,
 restart, mark idle, or resend an accepted prompt. Normal SDK activity clears the warning.
@@ -1017,6 +1024,17 @@ Run only those database regressions with:
 
 ```powershell
 npm run test:database
+```
+
+Run the recovery/state/UI regressions with `npm run test:session-health`. The opt-in live probe
+starts its own disposable SDK process and makes three real model requests; it never attaches to
+an existing host. It holds one harmless test tool while replaying an older terminal event, then
+checks recovery with notifications withheld. Results are saved under
+`.e2e-artifacts\session-recovery-live\`.
+
+```powershell
+npm run build
+node test\session-recovery-live.mjs --cli (Get-Command copilot).Source
 ```
 
 Run one launch profile while developing:

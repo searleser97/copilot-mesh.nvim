@@ -5,9 +5,13 @@ import test from "node:test";
 import { AgentDatabase } from "../dist/database.js";
 import { AssistantResponseCorrelation, CopilotRuntime } from "../dist/runtime.js";
 import { SessionHealth } from "../dist/session-health.js";
+import { SessionEventOrder } from "../dist/session-event-order.js";
 
+let previousEventId = null;
 function event(type, id, data = {}) {
-  return { type, id, data, timestamp: "2026-10-12T19:49:12.072Z", parentId: null };
+  const parentId = previousEventId;
+  previousEventId = id;
+  return { type, id, data, timestamp: "2026-10-12T19:49:12.072Z", parentId };
 }
 
 function clock() {
@@ -18,6 +22,7 @@ function clock() {
 }
 
 function fixture(t) {
+  previousEventId = null;
   const artifacts = resolve(".e2e-artifacts", "session-health-tests");
   mkdirSync(artifacts, { recursive: true });
   const directory = mkdtempSync(join(artifacts, "case-"));
@@ -35,6 +40,7 @@ function fixture(t) {
     idleCycle: 0, sequence: 0, seenEventIds: new Set(), lastRecoveryAt: 0,
     lastEventAt: 0, recoveringEvents: false, recoveryCursor: "initial-tail",
     recoveryPermissionRequests: new Map(), health: timer.health,
+    eventOrder: new SessionEventOrder(), recoveryOrderingWarning: false,
     responseCorrelation: new AssistantResponseCorrelation(),
     session: {
       sessionId: "session",
@@ -155,6 +161,332 @@ test("missing completion is replayed once, including expired-cursor overlaps", a
   assert.equal(f.emitted.filter((e) => e.type === "member.foreground_idle").length, 1);
   assert.equal(f.live.busy, false);
   assert.equal(f.sends(), 1);
+});
+
+for (const terminal of ["session.idle", "assistant.turn_end", "session.error"]) {
+  test(`recovered older ${terminal} cannot affect a newer turn on the same connection`, async (t) => {
+    const f = fixture(t);
+    const oldStart = event("assistant.turn_start", "old-start", { turnId: "0" });
+    const oldTerminal = {
+      ...event(terminal, "old-terminal", {
+        turnId: "0", errorType: "query", message: "Older turn error",
+      }),
+      parentId: oldStart.id,
+    };
+    const newStart = {
+      ...event("assistant.turn_start", "new-start", { turnId: "0" }),
+      parentId: oldTerminal.id,
+    };
+    f.runtime.handleSessionEvent(f.live, oldStart);
+    let finish;
+    f.live.session.rpc.eventLog.read = () => new Promise((resolve) => { finish = resolve; });
+    const pending = f.runtime.recoverSilentSession(f.live);
+    f.runtime.handleSessionEvent(f.live, newStart);
+    const beforeRecovery = f.emitted.length;
+    finish({
+      events: [oldTerminal], cursor: "old-terminal-cursor",
+      hasMore: false, cursorStatus: "ok",
+    });
+    await pending;
+    assert.equal(f.live.foregroundBusy, true);
+    assert.equal(f.live.foregroundTurnId, "0");
+    assert.equal(f.live.foregroundTurnSequence, 2);
+    assert.equal(f.emitted.slice(beforeRecovery).some((entry) =>
+      entry.type === "member.error" ||
+      entry.type === "member.foreground_idle" ||
+      entry.type === "member.turn_end" ||
+      entry.type === "member.state"
+    ), false, "older terminal must remain visible without changing current UI state");
+    assert.equal(f.emitted.filter((entry) =>
+      entry.type === "recovery.historical_event" && entry.payload.eventId === oldTerminal.id
+    ).length, 1);
+  });
+}
+
+for (const completed of [false, true]) {
+  test(`late older output and side effects stay historical when newer turn completed=${completed}`, async (t) => {
+    const f = fixture(t);
+    const start = event("assistant.turn_start", "old-start", { turnId: "0" });
+    const earlier = [
+      event("tool.execution_start", "tool-start", { toolCallId: "old-tool", toolName: "powershell" }),
+      event("tool.execution_complete", "tool-end", { toolCallId: "old-tool", success: true, result: { content: "old result" } }),
+      event("assistant.message_delta", "old-delta", { messageId: "old-reply", deltaContent: "Old " }),
+      event("assistant.message", "old-message", { messageId: "old-reply", turnId: "0", content: "Old response" }),
+      event("assistant.turn_end", "old-end", { turnId: "0" }),
+      event("session.error", "old-error", { errorType: "query", message: "Old error" }),
+      event("session.idle", "old-idle"),
+    ];
+    const current = event("assistant.turn_start", "current-start", { turnId: "0" });
+    f.runtime.handleSessionEvent(f.live, start);
+    f.runtime.handleSessionEvent(f.live, current);
+    f.runtime.handleSessionEvent(f.live, event("assistant.message_delta", "current-delta", {
+      messageId: "current-reply", deltaContent: "Current",
+    }));
+    if (completed) {
+      f.runtime.handleSessionEvent(f.live, event("assistant.message", "current-message", {
+        messageId: "current-reply", turnId: "0", content: "Current",
+      }));
+      f.runtime.handleSessionEvent(f.live, event("assistant.turn_end", "current-end", { turnId: "0" }));
+      f.runtime.handleSessionEvent(f.live, event("session.idle", "current-idle"));
+    }
+    const snapshot = {
+      busy: f.live.busy, foregroundBusy: f.live.foregroundBusy,
+      turn: f.live.foregroundTurnId, idleCycle: f.live.idleCycle,
+      correlation: f.live.responseCorrelation.snapshot(),
+    };
+    const before = f.emitted.length;
+    let drains = 0;
+    f.runtime.scheduleMailboxDrain = () => { drains += 1; };
+    f.live.session.rpc.eventLog.read = async () => ({
+      events: earlier, cursor: "old-tail", hasMore: false, cursorStatus: "expired",
+    });
+    await f.runtime.recoverSilentSession(f.live);
+    await f.runtime.recoverSilentSession(f.live);
+    assert.deepEqual({
+      busy: f.live.busy, foregroundBusy: f.live.foregroundBusy,
+      turn: f.live.foregroundTurnId, idleCycle: f.live.idleCycle,
+      correlation: f.live.responseCorrelation.snapshot(),
+    }, snapshot);
+    assert.equal(drains, 0);
+    assert.equal(f.emitted.slice(before).length, earlier.length);
+    assert.ok(f.emitted.slice(before).every((entry) => entry.type === "recovery.historical_event"));
+    assert.equal(f.sends(), 0);
+  });
+}
+
+test("lookahead uses page order across ancestry gaps while streamed turns continue", async (t) => {
+  const f = fixture(t);
+  const oldIdle = { ...event("session.idle", "old-idle"), parentId: "lost-old-parent" };
+  const current = { ...event("assistant.turn_start", "current", { turnId: "0" }), parentId: "lost-current-parent" };
+  f.runtime.handleSessionEvent(f.live, current);
+  let reads = 0;
+  let finish;
+  f.live.session.rpc.eventLog.read = async () => {
+    reads += 1;
+    if (reads === 1) return { events: [oldIdle], cursor: "page-1", hasMore: true, cursorStatus: "expired" };
+    return new Promise((resolve) => { finish = resolve; });
+  };
+  const pending = f.runtime.recoverSilentSession(f.live);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(f.live.recoveryCursor, "initial-tail", "unclassified prefix must not commit");
+  assert.equal(f.live.eventOrder.pending, 1);
+  const newer = { ...event("assistant.turn_start", "newer", { turnId: "0" }), parentId: current.id };
+  f.runtime.handleSessionEvent(f.live, newer);
+  finish({ events: [current, newer], cursor: "page-2", hasMore: false, cursorStatus: "ok" });
+  await pending;
+  assert.equal(f.live.foregroundBusy, true);
+  assert.equal(f.live.foregroundTurnSequence, 2);
+  assert.equal(f.live.eventOrder.watermark, newer.id);
+  assert.equal(f.live.eventOrder.pending, 0);
+  assert.equal(f.live.recoveryCursor, "page-2");
+  assert.equal(f.emitted.filter((e) => e.type === "recovery.historical_event").length, 1);
+});
+
+test("unorderable expiry is bounded, visible, blocks permission guesses and preserves streaming", async (t) => {
+  const f = fixture(t);
+  const current = { ...event("assistant.turn_start", "current", { turnId: "0" }), parentId: "lost-current-parent" };
+  f.runtime.handleSessionEvent(f.live, current);
+  let reads = 0;
+  let last;
+  f.live.session.rpc.eventLog.read = async ({ max }) => {
+    assert.equal(max, 200);
+    const events = Array.from({ length: 200 }, (_, index) => {
+      const id = `old-${reads}-${index}`;
+      const item = { ...event("session.idle", id), parentId: last?.id ?? "lost-old-parent" };
+      last = item;
+      return item;
+    });
+    reads += 1;
+    return { events, cursor: `page-${reads}`, hasMore: true, cursorStatus: reads === 1 ? "expired" : "ok" };
+  };
+  f.live.session.rpc.permissions.pendingRequests = () => assert.fail("unreconciled history must not deny permissions");
+  await f.runtime.recoverSilentSession(f.live);
+  await f.runtime.recoverSilentSession(f.live);
+  assert.equal(reads, 5);
+  assert.equal(f.live.eventOrder.pending, 1000);
+  assert.equal(f.live.recoveryCursor, "initial-tail");
+  assert.equal(f.health.snapshot().recoveryPhase, "ordering_blocked");
+  assert.equal(f.emitted.filter((e) => e.type === "member.recovery_warning").length, 1);
+  const delta = { ...event("assistant.message_delta", "current-delta", { messageId: "reply", deltaContent: "Still live" }), parentId: current.id };
+  f.runtime.handleSessionEvent(f.live, delta);
+  assert.equal(f.emitted.at(-1).type, "conversation.delta");
+  assert.equal(f.live.foregroundBusy, true);
+  const anchor = { ...event("assistant.turn_start", "anchor", { turnId: "1" }), parentId: last.id };
+  f.runtime.handleSessionEvent(f.live, anchor);
+  f.live.session.rpc.eventLog.read = async ({ cursor }) => {
+    assert.equal(cursor, "page-5");
+    return { events: [], cursor, hasMore: false, cursorStatus: "ok" };
+  };
+  f.live.session.rpc.permissions.pendingRequests = async () => ({ items: [] });
+  await f.runtime.recoverSilentSession(f.live);
+  assert.equal(f.live.eventOrder.pending, 0);
+  assert.equal(f.live.recoveryCursor, "page-5");
+  assert.equal(f.live.foregroundBusy, true);
+  assert.equal(f.emitted.filter((e) => e.type === "recovery.historical_event").length, 1000);
+  assert.equal(f.emitted.filter((e) => e.type === "member.recovery_resumed").length, 1);
+});
+
+test("startup history cannot overwrite a newer stream and genuine current terminals still apply", async (t) => {
+  const f = fixture(t);
+  const older = [
+    event("assistant.turn_start", "old-start", { turnId: "0" }),
+    event("assistant.turn_end", "old-end", { turnId: "0" }),
+  ];
+  const current = event("assistant.turn_start", "current", { turnId: "0" });
+  f.runtime.handleSessionEvent(f.live, current);
+  f.live.eventOrder.recordHistory([...older, current]);
+  f.runtime.applyOrderedHistoryState(f.live, older);
+  assert.equal(f.live.eventOrder.watermark, current.id);
+  assert.equal(f.live.foregroundBusy, true);
+  const events = [
+    event("assistant.message", "reply", { messageId: "reply", turnId: "0", content: "Current response" }),
+    event("assistant.turn_end", "end", { turnId: "0" }),
+    event("session.idle", "idle"),
+  ];
+  f.live.session.rpc.eventLog.read = async () => ({
+    events, cursor: "new-tail", hasMore: false, cursorStatus: "ok",
+  });
+  await f.runtime.recoverSilentSession(f.live);
+  assert.equal(f.live.foregroundBusy, false);
+  assert.equal(f.emitted.filter((e) => e.type === "conversation.message").length, 1);
+  assert.equal(f.emitted.filter((e) => e.type === "member.foreground_idle").length, 1);
+});
+
+for (const source of ["startup", "recovery"]) {
+  test(`older ${source} usage counts exactly once without reverting the current model`, async (t) => {
+    const f = fixture(t);
+    const usage = event("assistant.usage", "old-usage", {
+      model: "old-model", copilotUsage: { totalNanoAiu: 2_000_000_000 },
+    });
+    const current = event("assistant.turn_start", "current", { turnId: "0" });
+    f.runtime.handleSessionEvent(f.live, current);
+    f.live.aicUsed = 1;
+    f.live.modelId = "current-model";
+    if (source === "startup") {
+      f.live.eventOrder.recordHistory([usage, current]);
+      f.runtime.applyOrderedHistoryState(f.live, [usage]);
+      f.live.seenEventIds.add(usage.id);
+    }
+    f.live.session.rpc.eventLog.read = async () => ({
+      events: [usage], cursor: "usage-tail", hasMore: false, cursorStatus: "expired",
+    });
+    await f.runtime.recoverSilentSession(f.live);
+    await f.runtime.recoverSilentSession(f.live);
+    assert.equal(f.live.aicUsed, 3);
+    assert.equal(f.live.modelId, "current-model");
+    assert.equal(f.live.foregroundBusy, true);
+  });
+}
+
+test("historical permissions retain originals without repeating completed tool or permission effects", async (t) => {
+  const f = fixture(t);
+  const request = { kind: "read", path: "E:\\allowed\\file.txt" };
+  const requested = event("permission.requested", "permission-event", {
+    requestId: "permission", permissionRequest: request,
+  });
+  const current = event("assistant.turn_start", "current", { turnId: "0" });
+  f.runtime.handleSessionEvent(f.live, current);
+  const answers = [];
+  f.runtime.agents.set("agent", { agent: { permission: {} } });
+  f.runtime.evaluatePermissionRequest = async (_policy, _binding, actual) => {
+    assert.deepEqual(actual, request);
+    return { kind: "respond", response: { kind: "approved" } };
+  };
+  f.live.session.rpc.permissions.pendingRequests = async () => ({
+    items: answers.length ? [] : [{ requestId: "permission" }],
+  });
+  f.live.session.rpc.permissions.handlePendingPermissionRequest = async (answer) => { answers.push(answer); };
+  f.live.session.rpc.eventLog.read = async () => ({
+    events: [requested], cursor: "request-tail", hasMore: false, cursorStatus: "expired",
+  });
+  await f.runtime.recoverSilentSession(f.live);
+  await f.runtime.recoverSilentSession(f.live);
+  assert.equal(answers.length, 1);
+  assert.equal(f.emitted.filter((e) => e.type === "permission.requested").length, 0);
+  assert.equal(f.emitted.filter((e) => e.type === "recovery.historical_event").length, 1);
+  assert.equal(f.live.foregroundBusy, true);
+});
+
+test("connection continuity copies quarantined records and ordering metadata without aliasing", async (t) => {
+  const f = fixture(t);
+  const current = { ...event("assistant.turn_start", "current", { turnId: "0" }), parentId: "lost-current" };
+  f.runtime.handleSessionEvent(f.live, current);
+  const old = { ...event("session.idle", "old-idle"), parentId: "lost-old" };
+  f.live.eventOrder.enqueue([old], "scan-cursor", true);
+  const continuity = f.runtime.captureContinuity(f.live);
+  assert.equal(continuity.recoveryCursor, "initial-tail");
+  assert.equal(continuity.eventOrder.pending, 1);
+  f.live.eventOrder.watermark = old.id;
+  f.live.eventOrder.drain(new Set([old.id]), () => assert.fail("seen"), () => {});
+  assert.equal(continuity.eventOrder.watermark, current.id);
+  assert.equal(continuity.eventOrder.pending, 1);
+  assert.equal(continuity.eventOrder.readCursor("initial-tail"), "scan-cursor");
+});
+
+test("idle watchdog drains retained events after a streamed completion supplies ordering", async (t) => {
+  const f = fixture(t);
+  const current = { ...event("assistant.turn_start", "current", { turnId: "0" }), parentId: "lost-current" };
+  f.runtime.handleSessionEvent(f.live, current);
+  const old = { ...event("session.error", "old-error", { errorType: "query", message: "Earlier error" }), parentId: "lost-old" };
+  f.live.session.rpc.eventLog.read = async () => ({
+    events: [old], cursor: "scan", hasMore: false, cursorStatus: "expired",
+  });
+  await f.runtime.recoverSilentSession(f.live);
+  assert.equal(f.live.eventOrder.pending, 1);
+  const idle = { ...event("session.idle", "idle"), parentId: old.id };
+  f.runtime.handleSessionEvent(f.live, idle);
+  assert.equal(f.live.busy, false);
+  f.live.session.rpc.eventLog.read = async ({ cursor }) => ({
+    events: [], cursor, hasMore: false, cursorStatus: "ok",
+  });
+  f.advance(10_000);
+  await f.runtime.recoverSilentSessions();
+  assert.equal(f.live.eventOrder.pending, 0);
+  assert.equal(f.live.recoveryOrderingWarning, false);
+  assert.equal(f.emitted.filter((e) => e.type === "member.error").length, 0);
+  assert.equal(f.emitted.filter((e) => e.type === "recovery.historical_event").length, 1);
+});
+
+test("empty reads behind an unresolved prefix retain only one empty checkpoint", () => {
+  const order = new SessionEventOrder();
+  order.watermark = "unknown-watermark";
+  const pending = { ...event("session.idle", "pending-idle"), parentId: "unknown-parent" };
+  order.enqueue([pending], "pending", true);
+  for (let index = 0; index < 1000; index += 1) {
+    order.enqueue([], `empty-${index}`, false);
+  }
+  const committed = [];
+  order.drain(new Set([pending.id]), () => assert.fail("seen"), (cursor) => committed.push(cursor));
+  assert.deepEqual(committed, ["pending", "empty-999"]);
+  assert.equal(order.pending, 0);
+});
+
+test("partial ancestry, history anchors and expired overlaps never invert established order", () => {
+  let seed = 7381;
+  const choose = () => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return seed % 3;
+  };
+  for (let run = 0; run < 20; run += 1) {
+    const order = new SessionEventOrder();
+    const events = Array.from({ length: 100 }, (_, index) => ({
+      ...event("session.idle", `event-${index}`),
+      parentId: index === 0 ? null : `event-${index - 1}`,
+    }));
+    const available = events.filter(() => choose() !== 0);
+    for (const item of available) order.record(item);
+    order.recordHistory(events.filter((_, index) => index % 4 === 0));
+    order.enqueue(events.slice(20, 40), "page-1", false);
+    order.enqueue(events.slice(40, 60), "page-2", false);
+    order.enqueue(events.slice(30, 80).filter(() => choose() !== 0), "expired-page", true);
+    order.watermark = events[50].id;
+    for (let index = 0; index < events.length; index += 1) {
+      const relation = order.relation(events[index].id);
+      if (relation !== "unknown") {
+        assert.equal(relation, index < 50 ? "before" : index > 50 ? "after" : "same");
+      }
+    }
+  }
 });
 
 test("permanently pending recovery stays single-outstanding and does not flood warnings", async (t) => {
