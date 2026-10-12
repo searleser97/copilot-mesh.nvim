@@ -252,6 +252,8 @@ interface LiveSession {
   recoveryCursor: string | undefined;
   eventOrder: SessionEventOrder;
   recoveryOrderingWarning: boolean;
+  recoveryOrderingRevision: number;
+  recoveryRetentionWarning: boolean;
   recoveryPermissionRequests: Map<string, PermissionRequest>;
   idleCycle: number;
   mailboxDrainCycle: number;
@@ -2591,7 +2593,7 @@ export class CopilotRuntime implements RuntimeAdapter {
       if (
         this.agentGenerations.get(live.agentId) === live.generation
         && !this.transitions.has(live.agentId)
-        && (live.busy || live.health.waiting || live.eventOrder.pending > 0)
+        && (live.busy || live.health.waiting || live.eventOrder.pending > 0 || live.recoveryOrderingWarning)
         && !live.recoveringEvents
         && live.health.progressSilenceMs >= 10_000
         && now - live.lastRecoveryAt >= 10_000
@@ -2604,6 +2606,7 @@ export class CopilotRuntime implements RuntimeAdapter {
   }
 
   private async recoverSilentSession(live: LiveSession): Promise<void> {
+    if (live.recoveryOrderingWarning && live.recoveryOrderingRevision === live.eventOrder.revision) return;
     live.recoveringEvents = true;
     live.health.recovery("events");
     try {
@@ -2628,6 +2631,10 @@ export class CopilotRuntime implements RuntimeAdapter {
         if (!this.liveConnectionCurrent(live, false)) return;
         live.eventOrder.enqueue(page.events, page.cursor, page.cursorStatus === "expired");
         drain();
+        if (live.eventOrder.limitRetention()) {
+          this.warnRecoveryOrdering(live, true);
+          return;
+        }
         if (!page.hasMore) break;
         if (pageNumber === 4) {
           if (live.eventOrder.pending) this.warnRecoveryOrdering(live);
@@ -2641,6 +2648,7 @@ export class CopilotRuntime implements RuntimeAdapter {
       }
       if (live.recoveryOrderingWarning) {
         live.recoveryOrderingWarning = false;
+        live.recoveryRetentionWarning = false;
         this.emit("member.recovery_resumed", { message: "Recovered event ordering is established." },
           { runId: live.runId, memberId: live.target, target: "activity" });
       }
@@ -2772,15 +2780,22 @@ export class CopilotRuntime implements RuntimeAdapter {
     }
   }
 
-  private warnRecoveryOrdering(live: LiveSession): void {
+  private warnRecoveryOrdering(live: LiveSession, retentionLimited = false): void {
     live.health.recovery("ordering_blocked");
-    if (live.recoveryOrderingWarning) return;
+    live.recoveryOrderingRevision = live.eventOrder.revision;
+    if (live.recoveryOrderingWarning && (!retentionLimited || live.recoveryRetentionWarning)) return;
     live.recoveryOrderingWarning = true;
+    live.recoveryRetentionWarning ||= retentionLimited;
     this.emit("member.recovery_warning", {
-      message: "Some recovered Copilot events cannot yet be ordered against current activity. " +
-        "They are retained without changing the active turn; streaming continues. " +
-        "Automatic recovery pauses at 1000 retained events rather than dropping them.",
+      message: "Recovery degraded: ordering unknown. Unresolved records have not been applied; " +
+        "streaming continues. Backfill waits for new ordering evidence, preserving its committed checkpoint. " +
+        (retentionLimited
+          ? "The retained-payload budget was exceeded; unapplied payloads must be reread from that checkpoint. "
+          : "") +
+        "Retention is limited to 1000 events / 8 MiB of serialized payload. " +
+        "Restart cannot restore events already pruned by the SDK.",
       pendingEvents: live.eventOrder.pending,
+      pendingBytes: live.eventOrder.pendingBytes,
     }, { runId: live.runId, memberId: live.target, target: "activity" });
   }
 
@@ -4767,6 +4782,8 @@ export class CopilotRuntime implements RuntimeAdapter {
         recoveryCursor: continuity?.recoveryCursor,
         eventOrder: continuity?.eventOrder ?? new SessionEventOrder(),
         recoveryOrderingWarning: false,
+        recoveryOrderingRevision: -1,
+        recoveryRetentionWarning: false,
         recoveryPermissionRequests: new Map(),
         idleCycle: continuity?.idleCycle ?? 1,
         mailboxDrainCycle: continuity?.mailboxDrainCycle ?? 0,
@@ -4784,7 +4801,6 @@ export class CopilotRuntime implements RuntimeAdapter {
       const history = await session.getEvents();
       this.assertLiveMatchesRequest(live, request);
       const durableHistory = history.filter((event) => event.ephemeral !== true);
-      live.eventOrder.recordHistory(history);
       for (const event of durableHistory) {
         if (event.type === "permission.requested" && event.data.resolvedByHook !== true) {
           live.recoveryPermissionRequests.set(event.data.requestId, event.data.permissionRequest);
@@ -4810,7 +4826,7 @@ export class CopilotRuntime implements RuntimeAdapter {
         continuity === undefined
           ? durableHistory
           : stateReplayEvents;
-      this.applyOrderedHistoryState(live, stateReplayEvents);
+      this.applyOrderedHistoryState(live, history);
       for (const event of history) {
         live.seenEventIds.add(event.id);
       }
@@ -5037,18 +5053,20 @@ export class CopilotRuntime implements RuntimeAdapter {
   }
 
   private applyOrderedHistoryState(live: LiveSession, events: readonly SessionEvent[]): void {
-    for (const event of events) {
+    live.eventOrder.visitHistory(events, (event) => {
+      if (live.seenEventIds.has(event.id)) return;
       const relation = live.eventOrder.relation(event.id);
       if (event.type === "assistant.usage") {
         this.applyUsage(live, event, relation === "after" || relation === "same");
-        continue;
+        return;
       }
+      if (event.ephemeral === true) return;
       if (relation === "unknown") this.warnRecoveryOrdering(live);
       else if (relation !== "before") {
         this.applyReplayedSessionState(live, event);
         live.eventOrder.advance(event);
       }
-    }
+    });
   }
 
   private handleSessionEvent(
@@ -5062,6 +5080,7 @@ export class CopilotRuntime implements RuntimeAdapter {
       return;
     }
     live.seenEventIds.add(event.id);
+    live.eventOrder.revision += 1;
     live.lastEventAt = Date.now();
     if (event.type === "permission.requested" && event.data.resolvedByHook !== true) {
       live.recoveryPermissionRequests.set(event.data.requestId, event.data.permissionRequest);

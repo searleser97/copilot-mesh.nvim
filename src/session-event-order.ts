@@ -6,7 +6,7 @@ type Metadata = {
   history?: Position;
   recovery?: Position;
 };
-type Batch = { events: readonly SessionEvent[]; offset: number; cursor: string };
+type Batch = { events: readonly SessionEvent[]; sizes: readonly number[]; offset: number; cursor: string };
 export type EventRelation = "before" | "after" | "same" | "unknown";
 
 /** Uses SDK parent IDs and ordered batches, never timestamps or per-loop turn numbers. */
@@ -17,7 +17,10 @@ export class SessionEventOrder {
   private recoveryIndex = 0;
   private previousRecoveryId: string | undefined;
   private batches: Batch[] = [];
+  private unretainedIds = new Set<string>();
   watermark: string | undefined;
+  revision = 0;
+  private unresolvedId: string | undefined;
 
   copy(): SessionEventOrder {
     const copy = new SessionEventOrder();
@@ -27,26 +30,50 @@ export class SessionEventOrder {
     copy.recoveryIndex = this.recoveryIndex;
     copy.previousRecoveryId = this.previousRecoveryId;
     copy.batches = this.batches.map((batch) => ({ ...batch }));
+    copy.unretainedIds = new Set(this.unretainedIds);
     copy.watermark = this.watermark;
+    copy.revision = this.revision;
+    copy.unresolvedId = this.unresolvedId;
     return copy;
   }
 
   record(event: SessionEvent): void {
     const previous = this.nodes.get(event.id) ?? { parents: [] };
     const parent = event.parentId;
+    if (!this.nodes.has(event.id) || parent && !previous.parents.includes(parent)) this.revision += 1;
+    this.nodes.delete(event.id);
     this.nodes.set(event.id, {
       ...previous,
       parents: parent && !previous.parents.includes(parent)
-        ? [...previous.parents, parent] : previous.parents,
+        ? [...previous.parents, parent].slice(-3) : previous.parents,
     });
+    while (this.nodes.size > 20_000) {
+      const oldest = this.nodes.keys().next().value!;
+      const node = this.nodes.get(oldest)!;
+      this.nodes.delete(oldest);
+      if (oldest === this.watermark || oldest === this.unresolvedId) this.nodes.set(oldest, node);
+    }
   }
 
-  recordHistory(events: readonly SessionEvent[]): void {
+  recordHistory(events: readonly SessionEvent[]): number {
     const segment = ++this.segment;
     let previous: string | undefined;
     for (const [index, event] of events.entries()) {
       this.record(event);
       this.position(event.id, "history", { segment, index }, previous);
+      previous = event.id;
+    }
+    return segment;
+  }
+
+  visitHistory(events: readonly SessionEvent[], handle: (event: SessionEvent) => void): void {
+    const segment = this.recordHistory(events);
+    let previous: string | undefined;
+    for (const [index, event] of events.entries()) {
+      // Restore evicted positions from this supplied ordered snapshot, not guessed ancestry.
+      this.record(event);
+      this.position(event.id, "history", { segment, index }, previous);
+      handle(event);
       previous = event.id;
     }
   }
@@ -69,10 +96,12 @@ export class SessionEventOrder {
           ? this.previousRecoveryId : undefined);
       this.previousRecoveryId = event.id;
     }
+    const batch = { events, cursor, offset: 0, sizes: events.map((event) => Buffer.byteLength(JSON.stringify(event))) };
+    for (const event of events) this.unretainedIds.delete(event.id);
     if (events.length === 0 && this.batches.at(-1)?.events.length === 0) {
-      this.batches[this.batches.length - 1] = { events, cursor, offset: 0 };
+      this.batches[this.batches.length - 1] = batch;
     } else {
-      this.batches.push({ events, cursor, offset: 0 });
+      this.batches.push(batch);
     }
   }
 
@@ -80,11 +109,13 @@ export class SessionEventOrder {
     id: string, source: "history" | "recovery", position: Position, previous?: string,
   ): void {
     const node = this.nodes.get(id)!;
+    if (node[source]?.segment !== position.segment || node[source]?.index !== position.index ||
+      previous && !node.parents.includes(previous)) this.revision += 1;
     this.nodes.set(id, {
       ...node,
       [source]: position,
       parents: previous && previous !== id && !node.parents.includes(previous)
-        ? [...node.parents, previous] : node.parents,
+        ? [...node.parents, previous].slice(-3) : node.parents,
     });
   }
 
@@ -140,7 +171,28 @@ export class SessionEventOrder {
   }
 
   get pending(): number {
-    return this.batches.reduce((count, batch) => count + batch.events.length - batch.offset, 0);
+    return this.batches.reduce((count, batch) => count + batch.events.length - batch.offset, this.unretainedIds.size);
+  }
+
+  get pendingBytes(): number {
+    return this.batches.reduce((count, batch) =>
+      count + batch.sizes.slice(batch.offset).reduce((sum, size) => sum + size, 0), 0);
+  }
+
+  limitRetention(): boolean {
+    let limited = false;
+    while (this.pendingBytes > 8 * 1024 * 1024) {
+      // Keep the committed checkpoint before these unapplied records; never mark them seen.
+      const batch = this.batches.pop()!;
+      for (const event of batch.events.slice(batch.offset)) this.unretainedIds.add(event.id);
+      limited = true;
+    }
+    if (limited) {
+      this.recoverySegment = 0;
+      this.recoveryIndex = 0;
+      this.previousRecoveryId = undefined;
+    }
+    return limited;
   }
 
   readCursor(committed: string | undefined): string | undefined {
@@ -152,19 +204,35 @@ export class SessionEventOrder {
     handle: (event: SessionEvent, historical: boolean) => void,
     commit: (cursor: string) => void,
   ): void {
+    for (const id of this.unretainedIds) {
+      if (seen.has(id)) this.unretainedIds.delete(id);
+    }
     while (this.batches.length) {
       const batch = this.batches[0]!;
       while (batch.offset < batch.events.length) {
         const event = batch.events[batch.offset]!;
         if (!seen.has(event.id)) {
+          this.record(event);
           const relation = this.relation(event.id);
-          if (relation === "unknown") return;
+          if (relation === "unknown") {
+            this.unresolvedId = event.id;
+            batch.events = batch.events.slice(batch.offset);
+            batch.sizes = batch.sizes.slice(batch.offset);
+            batch.offset = 0;
+            return;
+          }
           handle(event, relation === "before");
         }
         batch.offset += 1;
       }
-      commit(batch.cursor);
+      if (this.unretainedIds.size > 0) {
+        batch.events = [];
+        batch.sizes = [];
+        batch.offset = 0;
+        if (this.batches.length === 1) return;
+      } else commit(batch.cursor);
       this.batches.shift();
     }
+    if (this.unretainedIds.size === 0) this.unresolvedId = undefined;
   }
 }

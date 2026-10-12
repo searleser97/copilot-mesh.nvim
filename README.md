@@ -275,9 +275,16 @@ events pruned by the SDK cannot be recovered indefinitely.
 Recovered events are ordered using SDK event IDs, parent links and ordered pages, not timestamps
 or turn numbers (which can repeat). Earlier output/errors are shown as **Recovered earlier**
 entries in Activity without changing the current response, busy state or idle-triggered delivery.
-If cursor expiry or missing ancestry prevents ordering, recovery warns and retains up to 1000
-unreconciled events without advancing its committed cursor. At that limit it pauses reading;
-live streaming remains active. A later ordering anchor can unblock recovery. This is a
+If cursor expiry or missing ancestry prevents ordering, status reports **Recovery degraded:
+ordering unknown**. Backfill pauses without advancing its committed cursor and does not poll
+the same gap again without new ordering evidence. Live streaming remains active. The ordering
+index holds at most 20,000 metadata records; unresolved content retention is capped at 1000
+events and 8 MiB of serialized payload. Oversized unapplied payloads are explicitly reported
+and must be reread from the preserved checkpoint, never marked applied. These limits do not
+bound an individual SDK response's transient transport allocation. Known missing event IDs
+remain unresolved even if the SDK expires their cursor, rather than reporting false recovery.
+A later ordering anchor
+can unblock recovery; restart cannot guarantee restoration of pruned SDK events. This is a
 conservative recovery limitation, not permission to assume completion or resend a prompt.
 After 60 seconds without foreground progress, Neovim displays a warning; a silent or hung recovery
 RPC cannot suppress that warning. Silence is not proof of failure: the host does not cancel,

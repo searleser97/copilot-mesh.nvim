@@ -95,7 +95,7 @@ try {
     generation: 1, alias: "probe", busy: false, foregroundBusy: false,
     foregroundTurnSequence: 0, sequence: 0, idleCycle: 0, lastEventAt: Date.now(),
     lastRecoveryAt: 0, recoveringEvents: false, recoveryCursor: cursor,
-    recoveryPermissionRequests: new Map(), recoveryOrderingWarning: false,
+    recoveryPermissionRequests: new Map(), recoveryOrderingWarning: false, recoveryOrderingRevision: -1,
     seenEventIds: new Set(history.map((event) => event.id)),
     historicalToolResults: new Map(), aicUsed: 0,
     health: new SessionHealth(() => {}), eventOrder: new SessionEventOrder(),
@@ -134,14 +134,15 @@ try {
   assert.equal(drains, 0);
   await wait(runtime.recoverSilentSession(live));
   assert.equal(live.foregroundBusy, true);
-  assert.equal(live.eventOrder.pending, 0, "B cursor anchor must reconcile any deferred A event");
-  assert.equal(emitted.filter((entry) =>
-    entry.type === "recovery.historical_event" && entry.payload.eventId === missedIdle.id
-  ).length, 1);
   gateResult.resolve();
   await wait(idleWait.promise);
   assert.equal(live.foregroundBusy, false);
   assert.equal(toolCalls, 1);
+  await wait(runtime.recoverSilentSession(live));
+  assert.equal(live.eventOrder.pending, 0, "new B evidence must reconcile any deferred A event");
+  assert.equal(emitted.filter((entry) =>
+    entry.type === "recovery.historical_event" && entry.payload.eventId === missedIdle.id
+  ).length, 1);
 
   dropAll = true;
   idleWait = deferred();

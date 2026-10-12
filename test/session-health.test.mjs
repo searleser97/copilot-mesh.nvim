@@ -40,7 +40,7 @@ function fixture(t) {
     idleCycle: 0, sequence: 0, seenEventIds: new Set(), lastRecoveryAt: 0,
     lastEventAt: 0, recoveringEvents: false, recoveryCursor: "initial-tail",
     recoveryPermissionRequests: new Map(), health: timer.health,
-    eventOrder: new SessionEventOrder(), recoveryOrderingWarning: false,
+    eventOrder: new SessionEventOrder(), recoveryOrderingWarning: false, recoveryOrderingRevision: -1,
     responseCorrelation: new AssistantResponseCorrelation(),
     session: {
       sessionId: "session",
@@ -460,6 +460,212 @@ test("empty reads behind an unresolved prefix retain only one empty checkpoint",
   assert.deepEqual(committed, ["pending", "empty-999"]);
   assert.equal(order.pending, 0);
 });
+
+test("an unresolved gap waits for new evidence rather than repolling the same cursor", async (t) => {
+  const f = fixture(t);
+  const current = { ...event("assistant.turn_start", "current", { turnId: "0" }), parentId: "missing-current" };
+  const old = { ...event("session.idle", "old"), parentId: "missing-old" };
+  f.runtime.handleSessionEvent(f.live, current);
+  let reads = 0;
+  f.live.session.rpc.eventLog.read = async () => {
+    reads += 1;
+    return { events: [old], cursor: "gap-tail", hasMore: false, cursorStatus: "expired" };
+  };
+  f.live.session.rpc.permissions.pendingRequests = () => assert.fail("unknown permission ordering");
+  await f.runtime.recoverSilentSession(f.live);
+  for (let index = 0; index < 100; index += 1) await f.runtime.recoverSilentSession(f.live);
+  assert.equal(reads, 1);
+  assert.equal(f.live.eventOrder.pending, 1);
+  assert.equal(f.live.recoveryCursor, "initial-tail");
+  assert.match(f.emitted.at(-1).payload.message, /Recovery degraded: ordering unknown/);
+  assert.equal(f.live.seenEventIds.has(old.id), false);
+  const anchor = { ...event("assistant.turn_start", "anchor", { turnId: "1" }), parentId: old.id };
+  f.runtime.handleSessionEvent(f.live, anchor);
+  f.live.session.rpc.permissions.pendingRequests = async () => ({ items: [] });
+  f.live.session.rpc.eventLog.read = async ({ cursor }) => {
+    assert.equal(cursor, "gap-tail");
+    reads += 1;
+    return { events: [], cursor, hasMore: false, cursorStatus: "ok" };
+  };
+  await f.runtime.recoverSilentSession(f.live);
+  assert.equal(reads, 2);
+  assert.equal(f.live.eventOrder.pending, 0);
+  assert.equal(f.live.foregroundBusy, true);
+  assert.equal(f.emitted.filter((entry) => entry.type === "recovery.historical_event").length, 1);
+});
+
+test("oversized unresolved payload preserves its checkpoint without retention or permission effects", async (t) => {
+  const f = fixture(t);
+  const current = { ...event("assistant.turn_start", "current", { turnId: "0" }), parentId: "missing-current" };
+  f.runtime.handleSessionEvent(f.live, current);
+  const old = { ...event("assistant.message", "oversized", {
+    messageId: "old-reply", content: "x".repeat(8 * 1024 * 1024),
+  }), parentId: "missing-old" };
+  let reads = 0;
+  f.live.session.rpc.eventLog.read = async ({ cursor }) => {
+    reads += 1;
+    assert.equal(cursor, "initial-tail");
+    return { events: [old], cursor: "oversized-tail", hasMore: false, cursorStatus: "expired" };
+  };
+  f.live.session.rpc.permissions.pendingRequests = () => assert.fail("unapplied permission history");
+  await f.runtime.recoverSilentSession(f.live);
+  assert.equal(f.live.eventOrder.pendingBytes, 0);
+  assert.equal(f.live.eventOrder.pending, 1, "keep the unapplied identity even without its payload");
+  assert.equal(f.live.recoveryCursor, "initial-tail");
+  assert.equal(f.live.seenEventIds.has(old.id), false);
+  assert.match(f.emitted.at(-1).payload.message, /payload budget was exceeded/);
+  for (let index = 0; index < 10; index += 1) await f.runtime.recoverSilentSession(f.live);
+  assert.equal(reads, 1);
+  assert.equal(f.emitted.filter((entry) => entry.type === "member.recovery_warning").length, 1);
+  const anchor = { ...event("assistant.turn_start", "anchor", { turnId: "1" }), parentId: old.id };
+  f.runtime.handleSessionEvent(f.live, anchor);
+  f.live.session.rpc.permissions.pendingRequests = async () => ({ items: [] });
+  await f.runtime.recoverSilentSession(f.live);
+  assert.equal(reads, 2);
+  assert.equal(f.live.recoveryCursor, "oversized-tail");
+  assert.equal(f.live.recoveryOrderingWarning, false);
+  assert.equal(f.live.foregroundBusy, true);
+  assert.equal(f.emitted.filter((entry) => entry.type === "recovery.historical_event").length, 1);
+});
+
+test("pruned oversized records cannot silently close a known recovery gap", async (t) => {
+  const f = fixture(t);
+  const current = { ...event("assistant.turn_start", "current", { turnId: "0" }), parentId: "missing-current" };
+  f.runtime.handleSessionEvent(f.live, current);
+  const missing = { ...event("assistant.message", "missing-payload", {
+    messageId: "old", content: "x".repeat(8 * 1024 * 1024),
+  }), parentId: "missing-old" };
+  f.live.session.rpc.eventLog.read = async () => ({
+    events: [missing], cursor: "old-tail", hasMore: false, cursorStatus: "ok",
+  });
+  f.live.session.rpc.permissions.pendingRequests = () => assert.fail("recovery gap still unresolved");
+  await f.runtime.recoverSilentSession(f.live);
+  const anchor = { ...event("assistant.turn_start", "anchor", { turnId: "1" }), parentId: missing.id };
+  f.runtime.handleSessionEvent(f.live, anchor);
+  let reads = 0;
+  f.live.session.rpc.eventLog.read = async () => {
+    reads += 1;
+    return { events: [], cursor: "rebased-tail", hasMore: false, cursorStatus: "expired" };
+  };
+  await f.runtime.recoverSilentSession(f.live);
+  await f.runtime.recoverSilentSession(f.live);
+  assert.equal(reads, 1);
+  assert.equal(f.live.eventOrder.pending, 1);
+  assert.equal(f.live.eventOrder.pendingBytes, 0);
+  assert.equal(f.live.recoveryCursor, "initial-tail");
+  assert.equal(f.live.recoveryOrderingWarning, true);
+  assert.equal(f.live.seenEventIds.has(missing.id), false);
+  assert.equal(f.emitted.some((entry) => entry.type === "member.recovery_resumed"), false);
+  assert.equal(f.live.eventOrder.copy().pending, 1, "reconnect must retain the missing identity");
+});
+
+test("ordering metadata stays bounded without fabricating order after eviction", () => {
+  const order = new SessionEventOrder();
+  const current = { ...event("assistant.turn_start", "current", { turnId: "0" }), parentId: "missing-current" };
+  order.record(current);
+  order.advance(current);
+  for (let index = 0; index < 25_000; index += 1) {
+    order.record({ ...event("session.idle", `bounded-${index}`), parentId: `missing-${index}` });
+  }
+  assert.equal(order.nodes.size, 20_000);
+  assert.ok(order.nodes.has(current.id));
+  assert.equal(order.relation("bounded-0"), "unknown");
+  assert.equal(order.relation("bounded-24999"), "unknown");
+  assert.ok([...order.nodes.values()].every((node) => node.parents.length <= 3));
+});
+
+test("large ordered startup snapshots preserve state despite bounded metadata eviction", (t) => {
+  const f = fixture(t);
+  const history = [
+    event("assistant.turn_start", "old-start", { turnId: "0" }),
+    ...Array.from({ length: 21_000 }, (_, index) => event("assistant.message", `history-${index}`, {
+      messageId: `message-${index}`, content: "Earlier content",
+    })),
+    event("assistant.turn_end", "old-end", { turnId: "0" }),
+    event("session.shutdown", "shutdown"),
+  ];
+  f.runtime.applyOrderedHistoryState(f.live, history);
+  assert.equal(f.live.busy, false);
+  assert.equal(f.live.foregroundBusy, false);
+  assert.equal(f.live.eventOrder.watermark, "shutdown");
+  assert.equal(f.live.recoveryOrderingWarning, false);
+  assert.equal(f.live.eventOrder.nodes.size, 20_000);
+  const current = event("assistant.turn_start", "current", { turnId: "0" });
+  f.runtime.handleSessionEvent(f.live, current);
+  f.runtime.applyOrderedHistoryState(f.live, [...history, current]);
+  assert.equal(f.live.foregroundBusy, true, "an already-streamed startup turn must survive old state");
+  assert.equal(f.live.eventOrder.watermark, current.id);
+  assert.equal(f.live.recoveryOrderingWarning, false);
+  assert.equal(f.live.eventOrder.nodes.size, 20_000);
+});
+
+for (const stage of ["tail", "history"]) {
+  test(`startup streaming during delayed ${stage} preserves the new turn and history inputs`, async (t) => {
+    const f = fixture(t);
+    const older = [
+      event("assistant.turn_start", "old-start", { turnId: "0" }),
+      event("permission.requested", "permission", {
+        requestId: "permission", permissionRequest: { kind: "read", path: "E:\\allowed.txt" },
+      }),
+      event("assistant.turn_end", "old-end", { turnId: "0" }),
+      event("session.shutdown", "old-shutdown"),
+    ];
+    const current = event("assistant.turn_start", "current", { turnId: "0" });
+    let subscribed;
+    let unblock;
+    let entered;
+    const blocked = new Promise((resolve) => { unblock = resolve; });
+    const reached = new Promise((resolve) => { entered = resolve; });
+    const calls = [];
+    const session = {
+      sessionId: "startup-session",
+      on: (listener) => { subscribed = listener; calls.push("subscribe"); return () => {}; },
+      getEvents: async () => {
+        calls.push("history");
+        if (stage === "history") { entered(); await blocked; }
+        return older;
+      },
+      rpc: {
+        permissions: { setApproveAll: async () => {} },
+        eventLog: { tail: async () => {
+          calls.push("tail");
+          if (stage === "tail") { entered(); await blocked; }
+          return { cursor: "startup-tail" };
+        } },
+        tools: { initializeAndValidate: async () => {}, getCurrentMetadata: async () => ({ tools: [] }) },
+        instructions: { getSources: async () => ({ sources: [] }) },
+        skills: { list: async () => ({ skills: [] }) },
+        mcp: { list: async () => ({ servers: [] }) },
+        plugins: { list: async () => ({ plugins: [] }) },
+        agent: { list: async () => ({ agents: [] }) },
+      },
+    };
+    f.runtime.ensureClient = async () => ({ createSession: async () => session });
+    f.runtime.assertConnectionCurrent = () => ({ agent: { permission: {} } });
+    f.runtime.activateSessionBinding = () => ({});
+    f.runtime.bindSessionHandlers = (config) => config;
+    f.runtime.sessionBindingCurrent = () => true;
+    f.runtime.assertLiveMatchesRequest = () => {};
+    f.runtime.modelStateForLive = async () => {};
+    const historyInputs = [];
+    f.runtime.replayHistory = async (_run, _target, events) => { historyInputs.push(...events); };
+    const pending = f.runtime.establishSession({
+      runId: "run", target: f.live.target, agentId: "agent", alias: "worker",
+      config: {}, configSignature: "startup-test", availableMcpServers: new Set(),
+    }, { generation: 1 });
+    await reached;
+    subscribed(current);
+    unblock();
+    const live = await pending;
+    assert.deepEqual(calls, ["subscribe", "tail", "history"]);
+    assert.equal(live.recoveryCursor, "startup-tail");
+    assert.equal(live.foregroundBusy, true);
+    assert.equal(live.eventOrder.watermark, current.id);
+    assert.equal(live.recoveryPermissionRequests.get("permission").path, "E:\\allowed.txt");
+    assert.ok(historyInputs.length > 0);
+    assert.equal(f.emitted.filter((entry) => entry.type === "member.state").at(-1).payload.state, "busy");
+  });
+}
 
 test("partial ancestry, history anchors and expired overlaps never invert established order", () => {
   let seed = 7381;
