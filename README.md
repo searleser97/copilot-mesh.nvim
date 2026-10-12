@@ -260,13 +260,22 @@ still use the main policy's approval posture. They auto-approve only when the ma
 approval requests that pass those ceilings also remain interactive, and the captured MCP subset is
 checked before either prompting or approving. A child may request `approveAll` only when the main
 command grants it, so the permission-free agent management tools cannot elevate a spawned agent.
-While a busy long-lived session is silent, the host checks the SDK's durable event and
+While a busy session (or a prompt awaiting its first SDK turn) is silent, the host checks the SDK's event and
 pending-permission state. Missed lifecycle events are replayed once, and each pending permission is
 matched back to its original full request before the same generation/session-bound evaluator
 applies MCP, path, tool, managed-approval, and `approveAll` rules. Requests whose original policy
 inputs cannot be reconstructed are denied closed. Permission and MCP-auth callbacks are bound to
 the exact agent generation and SDK session that created them; lifecycle transitions synchronously
 invalidate old callbacks and reject their pending requests before disconnect begins.
+Recovery uses bounded event-log pages rather than repeatedly downloading the entire conversation.
+After 60 seconds without foreground progress, Neovim displays a warning; a silent or hung recovery
+RPC cannot suppress that warning. Silence is not proof of failure: the host does not cancel,
+restart, mark idle, or resend an accepted prompt. Normal SDK activity clears the warning.
+Redacted `native-copilot.session-health` records in `native-copilot.log` correlate host/run/session
+IDs, prompt acceptance IDs, lifecycle/tool boundaries, upstream error tracing IDs, and recovery
+phase/timing. They exclude prompt text, tool arguments/results, reasoning, and raw error messages.
+Repeated warnings are limited to once every five minutes. Use these records when reporting a
+stall; error-only SDK logs alone cannot distinguish a model/network wait from lost host events.
 
 Commands mirror the primary mappings:
 

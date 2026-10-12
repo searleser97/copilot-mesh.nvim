@@ -2140,6 +2140,13 @@ local function update_status_buffer()
       entry.unread
     ))
   end
+  for _, member_id in ipairs(ordered_members()) do
+    local entry = buffers.get_member(member_id)
+    if entry.health_warning then
+      table.insert(lines, '')
+      table.insert(lines, ('**%s:** %s'):format(entry.display_name, entry.health_warning))
+    end
+  end
   vim.bo[state.status_buf].modifiable = true
   vim.api.nvim_buf_set_lines(state.status_buf, 0, -1, false, lines)
   vim.bo[state.status_buf].modifiable = false
@@ -3790,6 +3797,16 @@ function M._on_event(message)
   elseif message.type == 'permission.requested' then
     set_member_activity(member_id, 'Waiting for permission', true)
     request_permission(payload, member_id)
+  elseif message.type == 'member.stalled' then
+    buffers.append_activity_block(member_id, 'Waiting for Copilot', payload.message)
+    local member = buffers.get_member(member_id)
+    if member then member.health_warning = payload.message end
+    set_member_activity(member_id, 'No recent Copilot progress (request still pending)', true)
+    notify(payload.message, vim.log.levels.WARN)
+  elseif message.type == 'member.progress' then
+    local member = buffers.get_member(member_id)
+    if member then member.health_warning = nil end
+    buffers.append_activity_block(member_id, 'Copilot activity', payload.message)
   elseif message.type == 'member.error' then
     buffers.append_activity_block(member_id, 'Error', payload.message or vim.inspect(payload))
     buffers.set_state(member_id, 'error')

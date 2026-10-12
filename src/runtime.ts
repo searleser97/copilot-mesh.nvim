@@ -18,6 +18,7 @@ import {
 } from "@github/copilot-sdk";
 import { z } from "zod";
 import { AgentDatabase } from "./database.js";
+import { SessionHealth } from "./session-health.js";
 import type { AgentAdministration, PrimaryStartupClaim } from "./database.js";
 import {
   CALLER_SELECTOR,
@@ -246,6 +247,9 @@ interface LiveSession {
   lastEventAt: number;
   lastRecoveryAt: number;
   recoveringEvents: boolean;
+  health: SessionHealth;
+  recoveryCursor: string | undefined;
+  recoveryPermissionRequests: Map<string, PermissionRequest>;
   idleCycle: number;
   mailboxDrainCycle: number;
   approveAll: boolean;
@@ -2303,7 +2307,7 @@ export class CopilotRuntime implements RuntimeAdapter {
     );
     let sdkMessageId: string;
     try {
-      sdkMessageId = await live.session.send({ prompt: result.prompt, mode: "immediate" });
+      sdkMessageId = await this.sendObserved(live, id, { prompt: result.prompt, mode: "immediate" });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       // The durable row contains the user-facing slash command, while the SDK
@@ -2563,12 +2567,26 @@ export class CopilotRuntime implements RuntimeAdapter {
     const now = Date.now();
     const recoveries: Promise<void>[] = [];
     for (const live of this.live.values()) {
+      if (!this.liveConnectionCurrent(live, false)) continue;
+      const stalled = live.health.check(live.foregroundBusy);
+      if (stalled) {
+        this.emit(
+          "member.stalled",
+          {
+            ...stalled,
+            message: "No Copilot progress for at least 60 seconds. The request may still be " +
+              "running; it has not been retried or cancelled. Check /status and " +
+              "native-copilot.log, or cancel the foreground turn explicitly.",
+          },
+          { runId: live.runId, memberId: live.target, target: "activity" },
+        );
+      }
       if (
         this.agentGenerations.get(live.agentId) === live.generation
         && !this.transitions.has(live.agentId)
-        && live.busy
+        && (live.busy || live.health.waiting)
         && !live.recoveringEvents
-        && now - live.lastEventAt >= 10_000
+        && live.health.progressSilenceMs >= 10_000
         && now - live.lastRecoveryAt >= 10_000
       ) {
         live.lastRecoveryAt = now;
@@ -2580,26 +2598,27 @@ export class CopilotRuntime implements RuntimeAdapter {
 
   private async recoverSilentSession(live: LiveSession): Promise<void> {
     live.recoveringEvents = true;
+    live.health.recovery("events");
     try {
-      const events = await live.session.getEvents();
-      if (!this.liveConnectionCurrent(live, false)) {
-        return;
-      }
-      for (const event of events) {
-        if (!live.seenEventIds.has(event.id)) {
+      // Bound each recovery pass; never reload a long-lived session's entire transcript.
+      for (let pageNumber = 0; pageNumber < 5; pageNumber += 1) {
+        const page = await live.session.rpc.eventLog.read({
+          ...(live.recoveryCursor === undefined ? {} : { cursor: live.recoveryCursor }),
+          max: 200,
+        });
+        if (!this.liveConnectionCurrent(live, false)) return;
+        for (const event of page.events) {
           this.handleSessionEvent(live, event);
         }
-      }
-      const permissionRequests = new Map<string, PermissionRequest>();
-      for (const event of events) {
-        if (
-          event.type === "permission.requested" &&
-          event.data.resolvedByHook !== true
-        ) {
-          permissionRequests.set(event.data.requestId, event.data.permissionRequest);
+        live.recoveryCursor = page.cursor;
+        if (!page.hasMore) break;
+        if (pageNumber === 4) {
+          live.health.recovery("paused");
+          return;
         }
       }
 
+      live.health.recovery("permissions");
       const { items } = await live.session.rpc.permissions.pendingRequests();
       if (!this.liveConnectionCurrent(live, false)) {
         return;
@@ -2611,7 +2630,7 @@ export class CopilotRuntime implements RuntimeAdapter {
         if (this.pendingPermissions.has(pending.requestId)) {
           continue;
         }
-        const request = permissionRequests.get(pending.requestId);
+        const request = live.recoveryPermissionRequests.get(pending.requestId);
         if (!request) {
           await live.session.rpc.permissions.handlePendingPermissionRequest({
             requestId: pending.requestId,
@@ -2707,8 +2726,10 @@ export class CopilotRuntime implements RuntimeAdapter {
           },
         );
       }
+      live.health.recovery("complete");
     } catch (error) {
       if (this.liveConnectionCurrent(live, false)) {
+        live.health.recovery("failed");
         this.emit(
           "tasks.error",
           {
@@ -4693,6 +4714,19 @@ export class CopilotRuntime implements RuntimeAdapter {
         lastEventAt: Date.now(),
         lastRecoveryAt: 0,
         recoveringEvents: false,
+        health: new SessionHealth((entry) => {
+          process.stderr.write(JSON.stringify({
+            component: "native-copilot.session-health",
+            timestamp: new Date().toISOString(),
+            pid: process.pid,
+            runId,
+            sessionId: actualSessionId,
+            generation: request.generation,
+            ...entry,
+          }) + "\n");
+        }),
+        recoveryCursor: undefined,
+        recoveryPermissionRequests: new Map(),
         idleCycle: continuity?.idleCycle ?? 1,
         mailboxDrainCycle: continuity?.mailboxDrainCycle ?? 0,
         approveAll: usesApproveAll(context.agent.permission, this.policy.allowAll),
@@ -4702,10 +4736,18 @@ export class CopilotRuntime implements RuntimeAdapter {
       this.live.set(target, live);
       live.unsubscribe = session.on((event) => this.handleSessionEvent(live!, event));
       progress("history", "Loading conversation history");
+      // Capture before history, so events arriving during the load remain recoverable.
+      live.recoveryCursor = (await session.rpc.eventLog.tail()).cursor;
+      this.assertLiveMatchesRequest(live, request);
       const history = await session.getEvents();
       this.assertLiveMatchesRequest(live, request);
       const durableHistory = history.filter((event) => event.ephemeral !== true);
       for (const event of durableHistory) {
+        if (event.type === "permission.requested" && event.data.resolvedByHook !== true) {
+          live.recoveryPermissionRequests.set(event.data.requestId, event.data.permissionRequest);
+        } else if (event.type === "permission.completed") {
+          live.recoveryPermissionRequests.delete(event.data.requestId);
+        }
         if (event.type !== "tool.execution_complete" || event.agentId !== undefined) {
           continue;
         }
@@ -4954,6 +4996,18 @@ export class CopilotRuntime implements RuntimeAdapter {
     }
     live.seenEventIds.add(event.id);
     live.lastEventAt = Date.now();
+    if (event.type === "permission.requested" && event.data.resolvedByHook !== true) {
+      live.recoveryPermissionRequests.set(event.data.requestId, event.data.permissionRequest);
+    } else if (event.type === "permission.completed") {
+      live.recoveryPermissionRequests.delete(event.data.requestId);
+    }
+    if (live.health.event(event)) {
+      this.emit(
+        "member.progress",
+        { message: "Copilot activity resumed.", eventType: event.type },
+        { runId: live.runId, memberId: live.target, target: "activity" },
+      );
+    }
     live.sequence += 1;
     const fields = {
       runId: live.runId,
@@ -6860,6 +6914,22 @@ export class CopilotRuntime implements RuntimeAdapter {
     return this.sendUserPromptOnLive(live, content, true);
   }
 
+  private async sendObserved(
+    live: LiveSession,
+    id: string,
+    options: Parameters<CopilotSession["send"]>[0],
+  ): Promise<string> {
+    live.health.sendStarted(id);
+    try {
+      const sdkMessageId = await live.session.send(options);
+      live.health.sendSettled(id, sdkMessageId);
+      return sdkMessageId;
+    } catch (error) {
+      live.health.sendSettled(id);
+      throw error;
+    }
+  }
+
   private async sendUserPromptOnLive(
     live: LiveSession,
     content: string,
@@ -6879,7 +6949,7 @@ export class CopilotRuntime implements RuntimeAdapter {
     let sdkMessageId: string;
     try {
       const attachments = promptImageAttachments(content);
-      sdkMessageId = await live.session.send({
+      sdkMessageId = await this.sendObserved(live, id, {
         prompt: content,
         ...(attachments.length > 0 ? { attachments } : {}),
         mode: "immediate",
@@ -7084,7 +7154,7 @@ export class CopilotRuntime implements RuntimeAdapter {
         const attachments = message.kind === "user"
           ? promptImageAttachments(message.content)
           : [];
-        const sdkMessageId = await live.session.send({
+        const sdkMessageId = await this.sendObserved(live, message.id, {
           prompt,
           ...(attachments.length > 0 ? { attachments } : {}),
           mode: "immediate",
@@ -7243,6 +7313,7 @@ export class CopilotRuntime implements RuntimeAdapter {
               alias: live.alias,
               sessionId: live.session.sessionId,
               state: live.foregroundBusy ? "busy" : "idle",
+              health: live.health.snapshot(),
             }]
           : [];
       }),
