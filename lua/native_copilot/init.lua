@@ -3814,24 +3814,14 @@ function M._on_event(message)
       member_id, 'Recovered earlier ' .. (payload.eventType or 'event'), tostring(detail)
     )
   elseif message.type == 'member.recovery_warning' then
-    buffers.append_activity_block(member_id, 'Copilot recovery ordering', payload.message)
     local member = buffers.get_member(member_id)
     if member then member.recovery_warning = payload.message end
-    notify(payload.message, vim.log.levels.WARN)
   elseif message.type == 'member.recovery_resumed' then
     local member = buffers.get_member(member_id)
     if member then member.recovery_warning = nil end
-    buffers.append_activity_block(member_id, 'Copilot recovery ordering', payload.message)
-  elseif message.type == 'member.stalled' then
-    buffers.append_activity_block(member_id, 'Waiting for Copilot', payload.message)
-    local member = buffers.get_member(member_id)
-    if member then member.health_warning = payload.message end
-    set_member_activity(member_id, 'No recent Copilot progress (request still pending)', true)
-    notify(payload.message, vim.log.levels.WARN)
-  elseif message.type == 'member.progress' then
+  elseif message.type == 'member.stalled' or message.type == 'member.progress' then
     local member = buffers.get_member(member_id)
     if member then member.health_warning = nil end
-    buffers.append_activity_block(member_id, 'Copilot activity', payload.message)
   elseif message.type == 'member.error' then
     buffers.append_activity_block(member_id, 'Error', payload.message or vim.inspect(payload))
     buffers.set_state(member_id, 'error')

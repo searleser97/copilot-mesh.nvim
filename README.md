@@ -286,13 +286,15 @@ remain unresolved even if the SDK expires their cursor, rather than reporting fa
 A later ordering anchor
 can unblock recovery; restart cannot guarantee restoration of pruned SDK events. This is a
 conservative recovery limitation, not permission to assume completion or resend a prompt.
-After 60 seconds without foreground progress, Neovim displays a warning; a silent or hung recovery
-RPC cannot suppress that warning. Silence is not proof of failure: the host does not cancel,
-restart, mark idle, or resend an accepted prompt. Normal SDK activity clears the warning.
+After 60 seconds without foreground progress, the host records a diagnostic in the log, even if
+a recovery RPC hangs. Stall/resume diagnostics do not add Activity messages or Neovim notifications.
+Recovery-ordering degradation remains available in explicit `/status`, without unsolicited
+notifications or Activity messages. Silence is not proof of failure: the host does not cancel,
+restart, mark idle, or resend an accepted prompt.
 Redacted `native-copilot.session-health` records in `native-copilot.log` correlate host/run/session
 IDs, prompt acceptance IDs, lifecycle/tool boundaries, upstream error tracing IDs, and recovery
 phase/timing. They exclude prompt text, tool arguments/results, reasoning, and raw error messages.
-Repeated warnings are limited to once every five minutes. Use these records when reporting a
+Repeated stall log records are limited to once every five minutes. Use these records when reporting a
 stall; error-only SDK logs alone cannot distinguish a model/network wait from lost host events.
 `:NativeCopilotAbort` requests cancellation of the selected foreground turn without resending it.
 Cancellation still requires a responsive SDK transport; an earlier unacknowledged UI command can
