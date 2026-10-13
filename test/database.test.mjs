@@ -111,13 +111,37 @@ function seedBrokenV13(path) {
   db.close();
 }
 
+test("schema v17 additive migration preserves v16 rows and refuses a live older owner", (t) => {
+  const path = databasePath(t);
+  const initial = new AgentDatabase(path, () => false);
+  initial.createAgentRun("run", "agent", "worker", storedDefinition("worker"), "workspace", process.pid);
+  initial.upsertSession("run", "session", "connected");
+  initial.completeProvisionedAgentStartup("run");
+  initial.enqueueMessage("mail", "run", "agent:peer", "agent:agent", "agent", "pending");
+  initial.db.exec("DROP TABLE peer_transmissions; UPDATE schema_meta SET version = 16;");
+  const runs = initial.db.prepare("SELECT * FROM runs").all();
+  const messages = initial.db.prepare("SELECT * FROM messages").all();
+  initial.close();
+  assert.throws(() => new AgentDatabase(path, () => true), /restart|running|active/i);
+  const check = new DatabaseSync(path);
+  assert.equal(check.prepare("SELECT version FROM schema_meta").get().version, 16);
+  assert.equal(check.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name='peer_transmissions'").get().n, 0);
+  check.close();
+  const migrated = new AgentDatabase(path, () => false);
+  assert.equal(migrated.db.prepare("SELECT version FROM schema_meta").get().version, 17);
+  assert.deepEqual(migrated.db.prepare("SELECT * FROM runs").all(), runs);
+  assert.deepEqual(migrated.db.prepare("SELECT * FROM messages").all(), messages);
+  assert.equal(migrated.peerTransmission("mail"), undefined);
+  migrated.close();
+});
+
 test("schema v16 reconstructs a migration-failed primary without Standard rows", (t) => {
   const path = databasePath(t);
   seedBrokenV13(path);
 
   const db = new AgentDatabase(path, () => false);
   const schema = db.db.prepare("SELECT version FROM schema_meta").get();
-  assert.equal(schema.version, 16);
+  assert.equal(schema.version, 17);
 
   const primary = db.stagedPrimaryRun("workspace");
   assert.ok(primary);
@@ -201,7 +225,7 @@ test("schema v16 separates legacy rules into host-only links", (t) => {
   original.close();
 
   const migrated = new AgentDatabase(path, () => false);
-  assert.equal(migrated.db.prepare("SELECT version FROM schema_meta").get().version, 16);
+  assert.equal(migrated.db.prepare("SELECT version FROM schema_meta").get().version, 17);
   assert.deepEqual(migrated.agentAdministration("worker-agent"), {
     agentId: "worker-agent",
     ownerAgentId: "owner-agent",

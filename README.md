@@ -746,13 +746,33 @@ remains, `hasMore` is true and the next acknowledged call continues from the ret
 single oversized event is returned whole rather than corrupted by truncation.
 
 Messages store UUID-backed source/target identities and are written transactionally to SQLite
-before delivery. Busy recipients are not interrupted; each idle cycle claims and submits at most one
-message in SDK `immediate` mode. A transmission failure releases the claim to `pending` and schedules
-a bounded-backoff wakeup, while a message is marked delivered only after the SDK accepts it.
+before delivery. Authorized peer messages automatically steer busy recipients using the same SDK
+`immediate` send path as foreground user prompts. The SDK injects them at its next supported
+processing boundary; it does not preempt a running tool or model call, abort, or restart the task.
+Idle recipients wake normally. The send tool returns `status: "queued"` and
+`deliveredToMailbox`, not evidence that the recipient has processed the instruction. Messages shows
+**Queued for delivery** and then **Accepted by SDK**; the conversation labels actual SDK steering
+events with **(steering)** and preserves the sender's identity. Acceptance is not processing,
+completion, or a guarantee that a model will act on an instruction.
+
+Each wake claims at most one message, with 100 ms between scheduled mailbox wakes. Peer messages
+are FIFO within each recipient, including across multiple senders; unrelated recipients drain
+independently. SDK sends to a recipient are serialized with foreground user sends. Explicitly queued
+user prompts retain their existing idle-only behavior and do not block peer steering. Agents should
+reply only when needed, not automatically acknowledge acknowledgements.
+
+Schema v17 journals each peer transmission before calling the SDK and stores its acceptance receipt.
+An accepted peer message is never resent simply because lease completion or a connection transition
+failed. A known receipt can complete a newly claimed lease after recovery. The pinned SDK has no
+caller-supplied idempotency key: if a send fails or the host exits after transmission starts but before
+acceptance can be confirmed, delivery fails explicitly rather than guessing and duplicating work.
+Inspect the recipient's SDK history before manually retrying such an unconfirmed message.
+Failures before transmission retain bounded-backoff retry.
 Every claim has a random attempt token bound to its exact run and target. Completion, failure, and
 release require that current unexpired token while the row is still `delivering`, so a late SDK
 send from a superseded generation cannot complete mail that was reset or adopted elsewhere.
-Interrupted delivery returns to `pending` after restart.
+Interrupted delivery returns to `pending` after restart, then peer receipts are reconciled without
+another send; an unconfirmed prior attempt is reported as failed without automatic redelivery.
 
 Copilot’s session store remains authoritative for full conversation history. SQLite stores
 UUID/session mappings, all agent runs (including the primary), UUID-backed communication and
@@ -1043,6 +1063,26 @@ checks recovery with notifications withheld. Results are saved under
 npm run build
 node test\session-recovery-live.mjs --cli (Get-Command copilot).Source
 ```
+
+Run `npm run test:peer-steering` for mailbox ordering, serialization, durable receipts, lifecycle
+races, and Neovim steering/user-queue UI regressions. The opt-in live peer probe creates two new
+disposable SDK sessions and calls the real `real_agent_send_message` tool while the recipient is
+inside a gated tool. It asserts that the changed instruction executes before the first idle, with
+one durable message, one acceptance, no task restart/resend, and intact sender attribution:
+
+```powershell
+npm run build
+node test\peer-steering-live.mjs --cli (Get-Command copilot).Source
+```
+
+Evidence is written under `.e2e-artifacts\peer-steering-live\`. The separate
+`test\peer-steering-startup-live.lua` smoke test exercises isolated Neovim `:AI`, the actual Node
+host, a newly created SDK session, a harmless model reply, and the status UI. Set
+`PEER_STEERING_ROOT` to the plugin path, `PEER_STEERING_WORKSPACE` to a fresh disposable directory,
+and optionally `PEER_STEERING_RESOLVER` to a command resolver, then run it with
+`nvim --headless -u NONE -l test\peer-steering-startup-live.lua`. It never resumes an existing
+session; `startup-result.json` is saved in the disposable workspace. This isolated command alias
+does not validate a user's personal `:AI` mapping or live Neovim configuration.
 
 Run one launch profile while developing:
 

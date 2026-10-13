@@ -2658,7 +2658,12 @@ local function history_event(member_id, event, context)
     if content then
       local source_alias = json_value(data.sourceAlias)
       if source_alias then
-        buffers.append_agent_message(member_id, source_alias, content, event_time)
+        buffers.append_agent_message(
+          member_id,
+          source_alias .. (data.delivery == 'steering' and ' (steering)' or ''),
+          content,
+          event_time
+        )
       elseif agent_id or source:find('^agent%-') then
         local key = normalized_agent_message(content)
         local matches = context.agent_tool_prompts[key] or 0
@@ -3723,7 +3728,8 @@ function M._on_event(message)
     local event_timestamp = tonumber(json_value(payload.eventTimestamp))
     buffers.append_agent_message(
       member_id,
-      payload.sourceDisplayName or payload.source or 'Copilot agent',
+      (payload.sourceDisplayName or payload.source or 'Copilot agent')
+        .. (payload.delivery == 'steering' and ' (steering)' or ''),
       payload.content or '',
       event_timestamp and math.floor(event_timestamp / 1000) or nil
     )
@@ -3853,11 +3859,15 @@ function M._on_event(message)
     buffers.append_block(
       member_id,
       'messages',
-      message.type == 'mailbox.queued' and 'Sent' or 'Received',
+      message.type == 'mailbox.queued' and 'Queued for delivery' or 'Accepted by SDK',
       ('**%s → %s**\n\n%s'):format(payload.source or '?', payload.target or '?', payload.content or '')
     )
-  elseif message.type == 'mailbox.failed' then
-    buffers.append_block(member_id, 'messages', 'Delivery failed', payload.message or 'Unknown error')
+  elseif message.type == 'mailbox.failed' or message.type == 'mailbox.warning' then
+    buffers.append_block(
+      member_id, 'messages',
+      message.type == 'mailbox.failed' and 'Delivery failed' or 'Delivery warning',
+      payload.message or 'Unknown error'
+    )
   end
 
   if update_status_buffer and state.status_buf and vim.api.nvim_buf_is_valid(state.status_buf) then

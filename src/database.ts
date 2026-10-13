@@ -31,7 +31,7 @@ export type MessageStatus = "pending" | "delivering" | "delivered" | "failed";
  * Current durable schema version. Every run is one UUID-backed agent session; a
  * minimal primary marker identifies the agent attached to the main UI buffer.
  */
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 17;
 
 export interface StoredMessage {
   id: string;
@@ -50,6 +50,11 @@ export interface ClaimedMessage extends StoredMessage {
   deliveryAttempts: number;
   leaseToken: string;
   leaseUntil: string;
+}
+
+export interface PeerTransmission {
+  sessionId: string;
+  sdkMessageId: string | null;
 }
 
 export interface StateSnapshot {
@@ -343,6 +348,12 @@ export class AgentDatabase {
           last_error TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS peer_transmissions (
+          message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+          session_id TEXT NOT NULL,
+          sdk_message_id TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS activity_cursors (
           observer_id TEXT NOT NULL,
           target_agent_id TEXT NOT NULL,
@@ -373,7 +384,7 @@ export class AgentDatabase {
           updated_at TEXT NOT NULL
         );
       `);
-      if (schema.version >= 6 && schema.version < SCHEMA_VERSION) {
+      if (schema.version >= 6 && schema.version < 16) {
         if (schema.version < 12) {
           this.migrateDeliveryLeases();
         }
@@ -5295,7 +5306,9 @@ export class AgentDatabase {
     });
   }
 
-  claimMessages(runId: string, target: string, limit = 1, leaseMs = 60_000): ClaimedMessage[] {
+  claimMessages(
+    runId: string, target: string, limit = 1, leaseMs = 60_000, peersOnly = false,
+  ): ClaimedMessage[] {
     return this.transaction(() => {
       const timestamp = now();
       this.resetExpiredDeliveriesInTransaction(timestamp);
@@ -5306,13 +5319,47 @@ export class AgentDatabase {
              created_at AS createdAt, updated_at AS updatedAt
            FROM messages
            WHERE run_id = ? AND target = ? AND status = 'pending'
+             AND (? = 0 OR kind = 'agent')
            ORDER BY created_at, sequence
            LIMIT ?`,
         )
-        .all(runId, target, limit) as unknown as StoredMessage[];
+        .all(runId, target, peersOnly ? 1 : 0, limit) as unknown as StoredMessage[];
       const leaseUntil = new Date(Date.now() + leaseMs).toISOString();
       return this.claimRowsInTransaction(rows, runId, target, timestamp, leaseUntil);
     });
+  }
+
+  peerTransmission(id: string): PeerTransmission | undefined {
+    return this.db.prepare(
+      `SELECT session_id AS sessionId, sdk_message_id AS sdkMessageId
+       FROM peer_transmissions WHERE message_id = ?`,
+    ).get(id) as unknown as PeerTransmission | undefined;
+  }
+
+  /** Durable intent precedes the non-idempotent SDK call, including across run adoption. */
+  beginPeerTransmission(message: ClaimedMessage, sessionId: string): void {
+    const result = this.db.prepare(
+      `INSERT INTO peer_transmissions(message_id, session_id)
+       SELECT m.id, ? FROM messages m JOIN delivery_leases l ON l.message_id = m.id
+       WHERE m.id = ? AND m.run_id = ? AND m.target = ? AND m.kind = 'agent'
+         AND m.status = 'delivering' AND l.run_id = m.run_id AND l.target = m.target
+         AND l.lease_token = ? AND l.lease_until > ?`,
+    ).run(sessionId, message.id, message.runId, message.target, message.leaseToken, now());
+    if (result.changes !== 1) {
+      throw new Error(`Peer message "${message.id}" lost its lease before transmission.`);
+    }
+  }
+
+  /** Records a receipt, not lease completion: stale sends cannot complete an adopted claim. */
+  acceptPeerTransmission(id: string, sessionId: string, sdkMessageId: string): void {
+    const result = this.db.prepare(
+      `UPDATE peer_transmissions SET sdk_message_id = ?
+       WHERE message_id = ? AND session_id = ?
+         AND (sdk_message_id IS NULL OR sdk_message_id = ?)`,
+    ).run(sdkMessageId, id, sessionId, sdkMessageId);
+    if (result.changes !== 1) {
+      throw new Error(`Peer message "${id}" could not persist its SDK acceptance receipt.`);
+    }
   }
 
   private completeMessageInTransaction(

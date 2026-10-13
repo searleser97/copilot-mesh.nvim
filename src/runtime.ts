@@ -675,6 +675,7 @@ function compactHistoryEvent(event: HistorySourceEvent): HistoryReplayEvent | un
               source: "agent-message",
               sourceAlias: agentMessage.source,
               agentMessageId: agentMessage.id,
+              ...(typeof data.delivery === "string" ? { delivery: data.delivery } : {}),
             }
           : {
               content: data.content,
@@ -1740,6 +1741,8 @@ export class CopilotRuntime implements RuntimeAdapter {
   private readonly transitions = new Map<string, AgentTransition>();
   private readonly sessionBindings = new Map<string, SessionHandlerBinding>();
   private readonly drainingMailboxes = new Set<string>();
+  private readonly sessionSends = new Map<string, Promise<void>>();
+  private readonly mailboxDrainTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly mailboxDrainRequested = new Set<string>();
   private readonly mailboxRetryTimers = new Map<
     string,
@@ -4485,7 +4488,10 @@ export class CopilotRuntime implements RuntimeAdapter {
           "Send a durable asynchronous message to one authorized recipient. Identify it with an " +
           "alias, durable agent id, or current SDK session id returned by " +
           "real_agent_list_recipients. The host revalidates the current ACL; knowing a session " +
-          "id never grants permission.",
+          "id never grants permission. Returns mailbox-queued status, not processing confirmation. " +
+          "The host submits busy recipients' messages as SDK steering at the next supported " +
+          "processing boundary, without aborting running work; idle recipients wake normally. " +
+          "Do not send acknowledgements back and forth unless a reply is needed.",
         parameters: z.object({
           recipient: z
             .string()
@@ -4512,6 +4518,7 @@ export class CopilotRuntime implements RuntimeAdapter {
           );
           return {
             deliveredToMailbox: resolved.recipient.alias,
+            status: "queued",
             ...(resolved.sessionId === undefined ? {} : { sessionId: resolved.sessionId }),
             messageId: id,
           };
@@ -4832,6 +4839,12 @@ export class CopilotRuntime implements RuntimeAdapter {
       }
       if (continuity === undefined || replayEvents.length > 0) {
         const compactEvents = compactHistoryEvents(replayEvents);
+        for (const event of compactEvents) {
+          if (event.type === "user.message" && typeof event.data.sourceAlias === "string") {
+            const source = this.resolveAgentRef(event.data.sourceAlias);
+            if (source) event.data.sourceAlias = source.alias;
+          }
+        }
         await this.replayHistory(runId, target, compactEvents, continuity !== undefined);
       }
       if (continuity === undefined) {
@@ -5082,6 +5095,14 @@ export class CopilotRuntime implements RuntimeAdapter {
     live.seenEventIds.add(event.id);
     live.eventOrder.revision += 1;
     live.lastEventAt = Date.now();
+    if (event.type === "user.message") {
+      const peer = parseAgentMessagePrompt(event.data.content);
+      const transmission = peer ? this.db.peerTransmission(peer.id) : undefined;
+      if (peer && transmission?.sessionId === live.session.sessionId &&
+        "messageId" in event.data && typeof event.data.messageId === "string") {
+        this.db.acceptPeerTransmission(peer.id, live.session.sessionId, event.data.messageId);
+      }
+    }
     if (event.type === "permission.requested" && event.data.resolvedByHook !== true) {
       live.recoveryPermissionRequests.set(event.data.requestId, event.data.permissionRequest);
     } else if (event.type === "permission.completed") {
@@ -5131,6 +5152,7 @@ export class CopilotRuntime implements RuntimeAdapter {
                 target: live.target,
                 content: agentMessage.content,
                 eventTimestamp: Date.parse(event.timestamp),
+                delivery: event.data.delivery,
               },
               { ...fields, target: "conversation", done: false },
             );
@@ -7023,6 +7045,21 @@ export class CopilotRuntime implements RuntimeAdapter {
       live.health.sendSettled(id, sdkMessageId);
       return sdkMessageId;
     } catch (error) {
+      const receipt = this.db.peerTransmission(id);
+      if (receipt?.sessionId === live.session.sessionId && receipt.sdkMessageId) {
+        this.emit(
+          "mailbox.warning",
+          {
+            id,
+            message: `The SDK send acknowledgement failed: ${
+              error instanceof Error ? error.message : String(error)
+            }. Its observed SDK message confirms acceptance; the message will not be resent.`,
+          },
+          { runId: live.runId, memberId: live.target, target: "messages" },
+        );
+        live.health.sendSettled(id, receipt.sdkMessageId);
+        return receipt.sdkMessageId;
+      }
       live.health.sendSettled(id);
       throw error;
     }
@@ -7033,6 +7070,30 @@ export class CopilotRuntime implements RuntimeAdapter {
     content: string,
     retryOnFailure: boolean,
     initialTask = false,
+  ): Promise<string> {
+    return this.serializeSessionSend(live, () =>
+      this.deliverUserPrompt(live, content, retryOnFailure, initialTask));
+  }
+
+  private async serializeSessionSend<T>(live: LiveSession, operation: () => Promise<T>): Promise<T> {
+    const previous = this.sessionSends.get(live.target);
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => { release = resolve; });
+    this.sessionSends.set(live.target, next);
+    try {
+      if (previous) await previous;
+      if (!this.liveConnectionCurrent(live, true)) {
+        throw new Error("The SDK session selected for delivery is no longer current.");
+      }
+      return await operation();
+    } finally {
+      release();
+      if (this.sessionSends.get(live.target) === next) this.sessionSends.delete(live.target);
+    }
+  }
+
+  private async deliverUserPrompt(
+    live: LiveSession, content: string, retryOnFailure: boolean, initialTask: boolean,
   ): Promise<string> {
     if (!this.liveConnectionCurrent(live, true)) {
       throw new Error("The SDK session selected for this prompt is no longer current.");
@@ -7131,14 +7192,18 @@ export class CopilotRuntime implements RuntimeAdapter {
       this.mailboxDrainRequested.add(target);
       return;
     }
-    queueMicrotask(() => {
+    if (this.mailboxDrainTimers.has(target) || this.mailboxRetryTimers.has(target)) return;
+    const timer = setTimeout(() => {
+      this.mailboxDrainTimers.delete(target);
       if (this.shuttingDown) {
         return;
       }
       void this.drainMailbox(target, false).catch((error: unknown) => {
         this.reportMailboxFailure(target, error);
       });
-    });
+    }, 100);
+    timer.unref?.();
+    this.mailboxDrainTimers.set(target, timer);
   }
 
   private scheduleMailboxRetry(target: string, attempts: number): number {
@@ -7173,7 +7238,7 @@ export class CopilotRuntime implements RuntimeAdapter {
     return retryAttempts;
   }
 
-  /** Claims and transmits at most one message for one recipient idle cycle. */
+  /** One message per bounded wake; peer mail also steers an active recipient. */
   private async drainMailbox(target: string, retryWake: boolean): Promise<void> {
     if (this.drainingMailboxes.has(target)) {
       this.mailboxDrainRequested.add(target);
@@ -7219,141 +7284,183 @@ export class CopilotRuntime implements RuntimeAdapter {
           return;
         }
       }
-      if (live.busy) {
-        return;
-      }
-      if (!retryWake && live.mailboxDrainCycle >= live.idleCycle) {
-        return;
-      }
-      if (!this.liveConnectionCurrent(live, false)) {
-        return;
-      }
-      const [message] = this.db.claimMessages(live.runId, target, 1);
-      if (!message) {
-        if (retryWake) {
-          this.cancelMailboxRetry(target);
-        }
-        return;
-      }
-      if (!retryWake) {
-        live.mailboxDrainCycle = live.idleCycle;
-      }
-      const source = this.resolveAgentRef(message.source);
-      const sourceLabel = source?.alias ?? message.source;
-      const prompt =
-        message.kind === "user"
-          ? message.content
-          : `<agent_message id="${message.id}" source="${sourceLabel}">\n` +
-            `${message.content}\n` +
-            "</agent_message>\n\n" +
-            "Process this durable message from another Copilot agent. Respond or act as " +
-            "appropriate, and use the relevant send tool if the sender needs a direct answer.";
-      try {
-        const attachments = message.kind === "user"
-          ? promptImageAttachments(message.content)
-          : [];
-        const sdkMessageId = await this.sendObserved(live, message.id, {
-          prompt,
-          ...(attachments.length > 0 ? { attachments } : {}),
-          mode: "immediate",
-        });
-        if (!this.liveConnectionCurrent(live, false)) {
-          this.db.releaseMessage(
-            message.id,
-            message.runId,
-            message.target,
-            message.leaseToken,
-            "Delivery returned from a superseded SDK session.",
-          );
-          return;
-        }
-        if (
-          !this.db.completeMessage(
-            message.id,
-            message.runId,
-            message.target,
-            message.leaseToken,
-          )
-        ) {
-          return;
-        }
-        this.cancelMailboxRetry(target);
-        if (message.kind === "user") {
-          this.emit(
-            "prompt.accepted",
-            {
-              id: message.id,
-              sdkMessageId,
-              source: "user",
-              target: live.target,
-              content: message.content,
-              recovered: true,
-            },
-            { runId: live.runId, memberId: live.target, target: "conversation" },
-          );
-          return;
-        }
-        this.emit(
-          "mailbox.delivered",
-          {
-            id: message.id,
-            runId: message.runId,
-            target: message.target,
-            kind: message.kind,
-            content: message.content,
-            sequence: message.sequence,
-            createdAt: message.createdAt,
-            updatedAt: message.updatedAt,
-            deliveryAttempts: message.deliveryAttempts,
-            source: sourceLabel,
-            ...(source ? { sourceAgentId: source.agentId } : {}),
-            status: "delivered",
-          },
-          { runId: live.runId, memberId: live.target, target: "messages" },
-        );
-      } catch (error) {
-        const failure = error instanceof Error ? error.message : String(error);
-        if (!this.liveConnectionCurrent(live, false)) {
-          this.db.releaseMessage(
-            message.id,
-            message.runId,
-            message.target,
-            message.leaseToken,
-            failure,
-          );
-          return;
-        }
-        const released = this.db.failMessage(
-          message.id,
-          message.runId,
-          message.target,
-          message.leaseToken,
-          failure,
-          true,
-        );
-        if (!released) {
-          return;
-        }
-        const retryAttempt = this.scheduleMailboxRetry(
-          target,
-          message.deliveryAttempts,
-        );
-        this.emit(
-          "mailbox.failed",
-          {
-            id: message.id,
-            message: failure,
-            retrying: true,
-            attempts: retryAttempt,
-          },
-          { runId: live.runId, memberId: live.target, target: "messages", done: true },
-        );
-      }
+      await this.serializeSessionSend(live, () => this.deliverMailboxMessage(live, retryWake));
     } finally {
       this.drainingMailboxes.delete(target);
       if (this.mailboxDrainRequested.delete(target) && !this.shuttingDown) {
         this.scheduleMailboxDrain(target);
       }
+    }
+  }
+
+  private async deliverMailboxMessage(live: LiveSession, retryWake: boolean): Promise<void> {
+    const target = live.target;
+    if (!this.liveConnectionCurrent(live, false)) {
+      return;
+    }
+    const peersOnly = live.busy || live.health.waiting ||
+      (!retryWake && live.mailboxDrainCycle >= live.idleCycle);
+    const [message] = this.db.claimMessages(live.runId, target, 1, 60_000, peersOnly);
+    if (!message) {
+      if (retryWake) {
+        this.cancelMailboxRetry(target);
+      }
+      return;
+    }
+    if (!retryWake && message.kind !== "agent") {
+      live.mailboxDrainCycle = live.idleCycle;
+    }
+    const source = this.resolveAgentRef(message.source);
+    const sourceLabel = source?.alias ?? message.source;
+    const prompt =
+      message.kind === "user"
+        ? message.content
+        : `<agent_message id="${message.id}" source="${message.source}">\n` +
+          `${message.content}\n` +
+          "</agent_message>\n\n" +
+          "Process this durable message from another Copilot agent. Respond or act as " +
+          "appropriate, and use the relevant send tool only if the sender needs a direct answer. " +
+          "Do not acknowledge acknowledgements or start an automatic reply loop.";
+    try {
+      const attachments = message.kind === "user"
+        ? promptImageAttachments(message.content)
+        : [];
+      let sdkMessageId: string;
+      if (message.kind === "agent") {
+        const previous = this.db.peerTransmission(message.id);
+        if (previous && !previous.sdkMessageId) {
+          throw new Error(
+            `Peer message "${message.id}" has an unconfirmed SDK transmission. ` +
+            "It will not be resent automatically; inspect the recipient's history before retrying.",
+          );
+        }
+        if (previous?.sdkMessageId) {
+          sdkMessageId = previous.sdkMessageId;
+        } else {
+          this.db.beginPeerTransmission(message, live.session.sessionId);
+          sdkMessageId = await this.sendObserved(live, message.id, { prompt, mode: "immediate" });
+          this.db.acceptPeerTransmission(message.id, live.session.sessionId, sdkMessageId);
+        }
+      } else {
+        sdkMessageId = await this.sendObserved(live, message.id, {
+          prompt,
+          ...(attachments.length > 0 ? { attachments } : {}),
+          mode: "immediate",
+        });
+      }
+      const receiptDetail = message.kind === "agent"
+        ? " Its receipt is retained for lease-safe recovery without resending."
+        : "";
+      if (!this.liveConnectionCurrent(live, false)) {
+        this.db.releaseMessage(
+          message.id,
+          message.runId,
+          message.target,
+          message.leaseToken,
+          "Delivery returned from a superseded SDK session.",
+        );
+        this.reportMailboxFailure(target,
+          `Message "${message.id}" was accepted by a superseded SDK connection.${receiptDetail}`);
+        this.scheduleMailboxDrain(target);
+        return;
+      }
+      if (
+        !this.db.completeMessage(
+          message.id,
+          message.runId,
+          message.target,
+          message.leaseToken,
+        )
+      ) {
+        this.reportMailboxFailure(target,
+          `Message "${message.id}" was accepted but lost its delivery lease.${receiptDetail}`);
+        this.scheduleMailboxRetry(target, message.deliveryAttempts);
+        return;
+      }
+      this.cancelMailboxRetry(target);
+      this.scheduleMailboxDrain(target);
+      if (message.kind === "user") {
+        this.emit(
+          "prompt.accepted",
+          {
+            id: message.id,
+            sdkMessageId,
+            source: "user",
+            target: live.target,
+            content: message.content,
+            recovered: true,
+          },
+          { runId: live.runId, memberId: live.target, target: "conversation" },
+        );
+        return;
+      }
+      this.emit(
+        "mailbox.delivered",
+        {
+          id: message.id,
+          runId: message.runId,
+          target: message.target,
+          kind: message.kind,
+          content: message.content,
+          sequence: message.sequence,
+          createdAt: message.createdAt,
+          updatedAt: message.updatedAt,
+          deliveryAttempts: message.deliveryAttempts,
+          source: sourceLabel,
+          ...(source ? { sourceAgentId: source.agentId } : {}),
+          status: "delivered",
+          sdkMessageId,
+          acceptance: "sdk",
+          requestedDelivery: "immediate",
+        },
+        { runId: live.runId, memberId: live.target, target: "messages" },
+      );
+    } catch (error) {
+      const transmission = message.kind === "agent" ? this.db.peerTransmission(message.id) : undefined;
+      const uncertain = !!transmission && !transmission.sdkMessageId;
+      const detail = transmission?.sdkMessageId
+        ? " SDK acceptance is confirmed; its receipt is retained without resending."
+        : uncertain ? " SDK acceptance may have occurred; automatic redelivery is disabled." : "";
+      const failure = (error instanceof Error ? error.message : String(error)) + detail;
+      if (!this.liveConnectionCurrent(live, false)) {
+        this.db.failMessage(
+          message.id,
+          message.runId,
+          message.target,
+          message.leaseToken,
+          failure,
+          !uncertain,
+        );
+        this.reportMailboxFailure(target, failure);
+        return;
+      }
+      const released = this.db.failMessage(
+        message.id,
+        message.runId,
+        message.target,
+        message.leaseToken,
+        failure,
+        !uncertain,
+      );
+      if (!released) {
+        this.reportMailboxFailure(target, `Message "${message.id}" lost its delivery lease: ${failure}`);
+        return;
+      }
+      const retryAttempt = uncertain ? undefined : this.scheduleMailboxRetry(
+        target,
+        message.deliveryAttempts,
+      );
+      this.emit(
+        "mailbox.failed",
+        {
+          id: message.id,
+          message: failure,
+          retrying: !uncertain,
+          attempts: retryAttempt,
+        },
+        { runId: live.runId, memberId: live.target, target: "messages", done: true },
+      );
+      if (uncertain) this.scheduleMailboxDrain(target);
     }
   }
 
@@ -7423,6 +7530,8 @@ export class CopilotRuntime implements RuntimeAdapter {
       return;
     }
     this.shuttingDown = true;
+    for (const timer of this.mailboxDrainTimers.values()) clearTimeout(timer);
+    this.mailboxDrainTimers.clear();
     for (const [replayId, replay] of this.pendingHistoryReplays) {
       replay.reject(new Error(`History replay "${replayId}" stopped during shutdown.`));
     }
