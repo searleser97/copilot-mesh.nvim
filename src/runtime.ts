@@ -1156,7 +1156,7 @@ export function applyNativePolicy(config: SessionConfig, policy: NativePolicy): 
  */
 export function nativeSessionScaffold(policy: NativePolicy): SessionConfig {
   const config: SessionConfig = {
-    clientName: "native-copilot.nvim",
+    clientName: "copilot-mesh.nvim",
     workingDirectory: policy.workingDirectory,
     streaming: true,
     manageScheduleEnabled: true,

@@ -108,10 +108,10 @@ local function ensure_helper(options)
   local python = venv_python(options)
   if vim.fn.executable(python) ~= 1 then
     return false,
-      'Nemotron voice support is not prepared. Run :NativeCopilotVoiceSetup first.'
+      'Nemotron voice support is not prepared. Run :CopilotMeshVoiceSetup first.'
   end
   if vim.fn.filereadable(helper_path) ~= 1 then
-    return false, 'Native Copilot voice helper is missing: ' .. helper_path
+    return false, 'Copilot Mesh voice helper is missing: ' .. helper_path
   end
 
   local state = {

@@ -1,8 +1,8 @@
 {
-  "name": "native-copilot.nvim",
+  "name": "copilot-mesh.nvim",
   "version": "0.1.0",
   "private": true,
-  "description": "Native Neovim UI and durable multi-agent host for GitHub Copilot",
+  "description": "Copilot Mesh: a Neovim UI and durable multi-agent host for GitHub Copilot",
   "type": "module",
   "engines": {
     "node": "^20.19.0 || >=22.12.0"
@@ -10,7 +10,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test test/database.test.mjs test/response-correlation.test.mjs test/session-health.test.mjs test/peer-steering.test.mjs && nvim --headless -u NONE -l test/startup-picker.lua && nvim --headless -u NONE -l test/session-health.lua && nvim --headless -u NONE -l test/peer-steering.lua && python test/native_copilot_voice_test.py && pwsh -NoLogo -NoProfile -File scripts/run-visible-e2e.ps1",
+    "test": "npm run build && node --test test/database.test.mjs test/response-correlation.test.mjs test/session-health.test.mjs test/peer-steering.test.mjs test/rename-compat.test.mjs && nvim --headless -u NONE -l test/rename-compat.lua && nvim --headless -u NONE -l test/startup-picker.lua && nvim --headless -u NONE -l test/session-health.lua && nvim --headless -u NONE -l test/peer-steering.lua && python test/native_copilot_voice_test.py && pwsh -NoLogo -NoProfile -File scripts/run-visible-e2e.ps1",
+    "test:rename": "npm run build && node --test test/rename-compat.test.mjs && nvim --headless -u NONE -l test/rename-compat.lua",
     "test:voice": "python test/native_copilot_voice_test.py",
     "test:session-health": "npm run build && node --test test/session-health.test.mjs && nvim --headless -u NONE -l test/session-health.lua",
     "test:database": "npm run build && node --test test/agent-directory.test.mjs test/agent-resume.test.mjs test/database.test.mjs test/fleet-tools.test.mjs test/response-correlation.test.mjs test/session-health.test.mjs test/peer-steering.test.mjs",

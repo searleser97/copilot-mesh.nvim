@@ -498,7 +498,7 @@ async function main(): Promise<void> {
 
 main().catch((error) => {
   stderr.write(
-    `native-copilot host failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
+    `copilot-mesh host failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
   );
   process.exitCode = 1;
 });

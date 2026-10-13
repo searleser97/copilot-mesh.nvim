@@ -1,4 +1,4 @@
-# native-copilot.nvim
+# copilot-mesh.nvim
 
 A native Neovim interface for GitHub Copilot built around persistent UUID-backed agents:
 
@@ -22,28 +22,69 @@ The Copilot SDK is a local dependency of this repository. A global SDK installat
 Build the host:
 
 ```powershell
-Set-Location E:\native-copilot.nvim
+Set-Location E:\copilot-mesh.nvim
 npm install
 npm run build
 ```
 
-Load the local plugin with `lazy.nvim`:
+Install with `lazy.nvim`:
 
 ```lua
 {
-  "searleser97/native-copilot.nvim",
+  "searleser97/copilot-mesh.nvim",
   lazy = false,
   build = "npm install --no-audit --no-fund && npm run build",
   config = function()
-    require("native_copilot").setup()
+    require("copilot_mesh").setup()
   end,
 }
 ```
 
+### Upgrading from native-copilot.nvim
+
+The repository is now [searleser97/copilot-mesh.nvim](https://github.com/searleser97/copilot-mesh.nvim).
+Use `require("copilot_mesh")` and `:CopilotMesh*` commands in new configuration.
+`require("native_copilot")` and every `:NativeCopilot*` command remain supported aliases.
+Both module namespaces, including `.blink`, `.buffers`, and `.protocol`, return the same
+Lua objects and host; loading both does not start another instance.
+
+For an existing Lazy installation, change the repository string but retain its installation
+identity while hosts are running:
+
+```lua
+{
+  "searleser97/copilot-mesh.nvim",
+  name = "native-copilot.nvim",
+  lazy = false,
+  build = "npm install --no-audit --no-fund && npm run build",
+  config = function()
+    require("copilot_mesh").setup()
+  end,
+}
+```
+
+This intentionally keeps the `lazy/native-copilot.nvim` directory and the
+`native-copilot.nvim` lockfile key. Do not install the old and new repositories as separate
+plugins, or rename/delete a checkout used by a running host. Lazy identifies managed
+installations by `name`, so changing only `dir` while using a new name is not sufficient.
+Existing source checkouts can likewise keep their directory name. Set their remote to
+`https://github.com/searleser97/copilot-mesh.nvim.git`. Running hosts stay on their loaded
+code; new Neovim instances use the update without forcing a restart.
+
+This is a branding change, not a state migration. SQLite remains under
+`stdpath("data")/native-copilot/state.sqlite`, the voice environment under
+`stdpath("data")/native-copilot/voice`, and diagnostics in `native-copilot.log`.
+Existing `NATIVE_COPILOT_*` / `NVIM_COPILOT_*` environment controls, `native-copilot`
+filetype and buffer URIs, `native_copilot_*` buffer markers, and `NativeCopilot*`
+highlight groups remain unchanged for integrations and themes. Internal implementation
+and voice-helper paths retain their legacy names. No database is copied, replaced, or
+re-keyed: SDK session IDs, durable agent IDs, history, mailboxes, links, and approvals
+continue to use the original persisted state.
+
 UI and rendering defaults can be adjusted in `setup`:
 
 ```lua
-require("native_copilot").setup({
+require("copilot_mesh").setup({
   -- Defaults to NVIM_COPILOT_CMD_RESOLVER.
   runtime_command_resolver = nil,
   stream_flush_ms = 80,
@@ -115,7 +156,7 @@ never written to plugin configuration, logs, SQLite, or conversation buffers.
 
 | Binding | Action |
 |---|---|
-| `<leader>ait` | Toggle the native Copilot tab; starts the primary Copilot agent when needed |
+| `<leader>ait` | Toggle the Copilot Mesh tab; starts the primary Copilot agent when needed |
 | `<leader>aif` | Stop an active agent or recover an inactive one |
 | `<leader>ais` | Telescope picker for overview, status, member, and view |
 | `[a` / `]a` | Previous/next member conversation or prompt recipient |
@@ -137,7 +178,7 @@ never written to plugin configuration, logs, SQLite, or conversation buffers.
 | `q` / `<BS>` in activity details | Close the floating detail pane |
 | `dd` in task details | Cancel the running or waiting task |
 
-Opening Native Copilot first shows the existing workspace session picker with `[New Session]`
+Opening Copilot Mesh first shows the existing workspace session picker with `[New Session]`
 selected. Choose it to start normally, choose a previous session to resume directly, or cancel
 without creating a session. Listing still starts the SDK client and loads session metadata, but
 primary-session creation and environment loading wait until selection. Reopening an active UI
@@ -148,10 +189,10 @@ preserves the draft and returns focus to the prompt:
 
 ```lua
 vim.keymap.set("i", "<M-l>", function()
-  require("native_copilot").cycle_member(1)
+  require("copilot_mesh").cycle_member(1)
 end)
 vim.keymap.set("i", "<M-h>", function()
-  require("native_copilot").cycle_member(-1)
+  require("copilot_mesh").cycle_member(-1)
 end)
 ```
 
@@ -159,11 +200,11 @@ Prompt submission is also exposed as a public function for user-defined buffer-l
 
 ```lua
 vim.keymap.set({ "n", "i" }, "<M-CR>", function()
-  require("native_copilot").submit_prompt()
+  require("copilot_mesh").submit_prompt()
 end, { buffer = true })
 ```
 
-`submit_prompt()` returns `false` and displays a warning when called outside the Native Copilot
+`submit_prompt()` returns `false` and displays a warning when called outside the Copilot Mesh
 prompt buffer or when the prompt cannot be submitted.
 
 Submitting with `<Enter>` or `<C-s>` while the selected Copilot is busy steers its active turn.
@@ -178,13 +219,13 @@ attachment API, including when a queued prompt is retried. Configure the destina
 bounded capture timeout in `setup()`:
 
 Terminals that retain `<C-v>` for ordinary text paste can send `<F24>` when the Windows clipboard
-contains an image. Native Copilot handles `<F24>` identically inside `AI Prompt`; the terminal
+contains an image. Copilot Mesh handles `<F24>` identically inside `AI Prompt`; the terminal
 remains responsible for detecting the clipboard format and leaves non-image paste unchanged. A
 small Win32 clipboard-format probe is available at
 `tools/windows-clipboard-image-probe.rs` for terminal configurations that need it.
 
 ```lua
-require("native_copilot").setup({
+require("copilot_mesh").setup({
   clipboard = {
     image_directory = "~/Downloads",
     capture_timeout_ms = 5000,
@@ -200,10 +241,10 @@ require("native_copilot").setup({
 })
 ```
 
-On Windows, run `:NativeCopilotVoiceSetup` once to create an isolated Python environment and
+On Windows, run `:CopilotMeshVoiceSetup` once to create an isolated Python environment and
 download the local Nemotron streaming speech model (about 731 MB). After setup, `<C-g>v` starts
-live dictation through Foundry Local and the default microphone. By default, opening the Native
-Copilot UI starts loading the model in the background so the first dictation does not pay the full
+live dictation through Foundry Local and the default microphone. By default, opening the Copilot
+Mesh UI starts loading the model in the background so the first dictation does not pay the full
 startup cost; set `voice.preload = false` to load it on first use instead. The model stays loaded in
 a persistent helper between dictation sessions. Nemotron keeps listening until you explicitly stop
 it. Partial recognition appears as temporary inline text while speaking, then the finalized
@@ -214,7 +255,7 @@ and transcription remain on the machine. The prompt winbar also provides a click
 control whose label shows whether dictation is idle, loading, listening, or finalizing.
 
 Set `voice.provider = "system"` to explicitly use the legacy Windows `System.Speech` recognizer
-without installing Nemotron. Native Copilot does not silently fall back when the configured
+without installing Nemotron. Copilot Mesh does not silently fall back when the configured
 provider is unavailable. `voice.system_listen_timeout_ms` controls the legacy recognizer's
 one-utterance timeout.
 
@@ -248,7 +289,7 @@ supports pausing, editing, and cancelling before dispatch.
 Slash commands are rendered as normal `👨` turns rather than duplicated `[command]` rows; their
 text output remains under `🤖`, and any work they start is represented by the resulting
 task, tool, environment, or schedule rows. Use `/tasks` or
-`:NativeCopilotTasks` to browse all tracked tasks and open one in the same floating detail pane.
+`:CopilotMeshTasks` to browse all tracked tasks and open one in the same floating detail pane.
 
 The resolved main Copilot command defines the primary session's initial permission policy.
 `--allow-all` uses the SDK's `approveAll` decision behind the lifecycle guard; otherwise
@@ -296,28 +337,28 @@ IDs, prompt acceptance IDs, lifecycle/tool boundaries, upstream error tracing ID
 phase/timing. They exclude prompt text, tool arguments/results, reasoning, and raw error messages.
 Repeated stall log records are limited to once every five minutes. Use these records when reporting a
 stall; error-only SDK logs alone cannot distinguish a model/network wait from lost host events.
-`:NativeCopilotAbort` requests cancellation of the selected foreground turn without resending it.
+`:CopilotMeshAbort` requests cancellation of the selected foreground turn without resending it.
 Cancellation still requires a responsive SDK transport; an earlier unacknowledged UI command can
 also delay it because host commands are serialized.
 
 Commands mirror the primary mappings:
 
 ```vim
-:NativeCopilotToggle
-:NativeCopilotSelect
-:NativeCopilotAgents
-:NativeCopilotStatus
-:NativeCopilotTasks
-:NativeCopilotAbort
-:NativeCopilotCancelBackground
-:NativeCopilotReloadMcp
+:CopilotMeshToggle
+:CopilotMeshSelect
+:CopilotMeshAgents
+:CopilotMeshStatus
+:CopilotMeshTasks
+:CopilotMeshAbort
+:CopilotMeshCancelBackground
+:CopilotMeshReloadMcp
 ```
 
 Selection uses `vim.ui.select` by default. To use Telescope for Copilot command, session, task,
 model, MCP, and agent pickers, install it separately and opt in explicitly:
 
 ```lua
-require("native_copilot").setup({
+require("copilot_mesh").setup({
   frontend = {
     picker = "telescope",
   },
@@ -442,7 +483,7 @@ The user must explicitly trust each exact directory in the host's Neovim setup, 
 host normally to apply it:
 
 ```lua
-require("native_copilot").setup({
+require("copilot_mesh").setup({
   file_hook_directories = { [[E:\sydney2]] },
 })
 ```
@@ -613,7 +654,7 @@ Omitting an override inherits the shared native default; omitting `mcpServers` s
 the agent's durable primary-server snapshot rather than servers added later.
 
 Neovim always starts one generic primary agent that stays connected for the host lifetime. Opening
-Native Copilot starts a fresh SDK conversation; previous primary conversations are never resumed
+Copilot Mesh starts a fresh SDK conversation; previous primary conversations are never resumed
 automatically and remain available only through explicit `/resume`. The durable primary UUID,
 alias, ACLs, mailbox, and monitor relationships carry forward to the fresh conversation. Agents
 are created one at a time with `real_agent_create`, either from an ordinary prompt or from a saved
@@ -940,7 +981,7 @@ The client-native command set is intentionally small:
 
 All other commands use the active runtime's dynamic command catalog and invocation result.
 
-`/mcp-reload` and `:NativeCopilotReloadMcp` call the SDK's session-scoped
+`/mcp-reload` and `:CopilotMeshReloadMcp` call the SDK's session-scoped
 `session.rpc.mcp.reload()` API. They stop and reconnect the selected session's MCP servers,
 refresh the inline environment rows, and do not restart or replace the Copilot session.
 
@@ -968,17 +1009,17 @@ integrations, commands come from `session.rpc.commands.list()`. The model and MC
 typed session RPCs so commands that are interactive in Copilot CLI remain actionable rather than
 returning an inert completion. CLI-owned general session navigation such as `/new` and `/clear` is
 not currently exposed by the SDK session command registry. Standalone-agent recovery remains
-available through `<leader>aif` and `:NativeCopilotSelect`, which restore plugin-owned UUID,
+available through `<leader>aif` and `:CopilotMeshSelect`, which restore plugin-owned UUID,
 mailbox, ACL, and SDK-session state.
 
 The SDK does expose typed task-management RPCs, which the plugin uses directly:
 
-- `:NativeCopilotTasks` opens a picker for the selected session's tracked tasks.
-- `:NativeCopilotCancelBackground` cancels every background subagent in the selected session.
-- `:NativeCopilotAbort` aborts the selected session's foreground turn while keeping the session usable.
+- `:CopilotMeshTasks` opens a picker for the selected session's tracked tasks.
+- `:CopilotMeshCancelBackground` cancels every background subagent in the selected session.
+- `:CopilotMeshAbort` aborts the selected session's foreground turn while keeping the session usable.
 
 Cancelling all background agents does not terminate promoted attached shell processes. A running
-shell tracked by the task registry can instead be selected through `:NativeCopilotTasks` and
+shell tracked by the task registry can instead be selected through `:CopilotMeshTasks` and
 cancelled from its floating detail pane.
 
 ### Optional blink.cmp source
@@ -988,13 +1029,13 @@ cancelled from its floating detail pane.
 ```lua
 sources = {
   default = function()
-    if vim.b.native_copilot_prompt then return { "native_copilot", "path" } end
+    if vim.b.native_copilot_prompt then return { "copilot_mesh", "path" } end
     return { "lsp", "buffer", "snippets", "path" }
   end,
   providers = {
-    native_copilot = {
+    copilot_mesh = {
       name = "Copilot",
-      module = "native_copilot.blink",
+      module = "copilot_mesh.blink",
       enabled = function() return vim.b.native_copilot_prompt == true end,
       async = true,
       score_offset = 100,
@@ -1065,6 +1106,11 @@ checks recovery with notifications withheld. Results are saved under
 npm run build
 node test\session-recovery-live.mjs --cli (Get-Command copilot).Source
 ```
+
+Run `npm run test:rename` for shared Lua module identity, command aliases, idempotent setup,
+and the real host's legacy/default/explicit database selection. Set
+`COPILOT_MESH_LEGACY_FIRST=1` when running `test\rename-compat.lua` to check legacy-first loading.
+These tests use isolated fixtures and never open the user's state database.
 
 Run `npm run test:peer-steering` for mailbox ordering, serialization, durable receipts, lifecycle
 races, and Neovim steering/user-queue UI regressions. The opt-in live peer probe creates two new

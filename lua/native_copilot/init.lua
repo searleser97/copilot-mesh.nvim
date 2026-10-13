@@ -225,7 +225,7 @@ local function set_member_activity(member_id, label, active)
 end
 
 local function notify(message, level)
-  vim.notify(message, level or vim.log.levels.INFO, { title = 'Native Copilot' })
+  vim.notify(message, level or vim.log.levels.INFO, { title = 'Copilot Mesh' })
 end
 
 local function restore_resume_cursor_animation(delay)
@@ -281,7 +281,7 @@ function M.paste_clipboard()
     or vim.api.nvim_get_current_buf() ~= state.prompt_buf
   then
     notify(
-      'Clipboard paste is only available from the Native Copilot prompt buffer.',
+      'Clipboard paste is only available from the Copilot Mesh prompt buffer.',
       vim.log.levels.WARN
     )
     return false
@@ -340,7 +340,7 @@ function M.dictate_voice()
     or vim.api.nvim_get_current_buf() ~= state.prompt_buf
   then
     notify(
-      'Voice dictation is only available from the Native Copilot prompt buffer.',
+      'Voice dictation is only available from the Copilot Mesh prompt buffer.',
       vim.log.levels.WARN
     )
     return false
@@ -357,7 +357,7 @@ function M.dictate_voice()
     then
       set_voice_status('idle')
       notify(
-        'Voice dictation was not started because the Native Copilot prompt lost focus.',
+        'Voice dictation was not started because the Copilot Mesh prompt lost focus.',
         vim.log.levels.WARN
       )
       return
@@ -720,7 +720,7 @@ function M.submit_prompt()
     or vim.api.nvim_get_current_buf() ~= state.prompt_buf
   then
     notify(
-      'Prompt submission is only available from the Native Copilot prompt buffer.',
+      'Prompt submission is only available from the Copilot Mesh prompt buffer.',
       vim.log.levels.WARN
     )
     return false
@@ -735,7 +735,7 @@ function M.enqueue_prompt()
     or vim.api.nvim_get_current_buf() ~= state.prompt_buf
   then
     notify(
-      'Prompt queueing is only available from the Native Copilot prompt buffer.',
+      'Prompt queueing is only available from the Copilot Mesh prompt buffer.',
       vim.log.levels.WARN
     )
     return false
@@ -2011,7 +2011,7 @@ function M.open(open_options)
   end
   if not start_host() then
     stop_loading_animation()
-    set_loading_message('Native Copilot host failed to start. Check notifications and logs.')
+    set_loading_message('Copilot Mesh host failed to start. Check notifications and logs.')
     return
   end
   send('hello')
@@ -2117,7 +2117,7 @@ local function update_status_buffer()
   end
   table.sort(active_agents)
   local lines = {
-    '# Native Copilot Status',
+    '# Copilot Mesh Status',
     '',
     ('- **Mode:** %s'):format(state.mode),
     ('- **Primary:** %s'):format(
@@ -2931,7 +2931,7 @@ function M._on_event(message)
     state.startup_requests = {}
     stop_loading_animation()
     state.loading_target = nil
-    set_loading_message(payload.message or 'Native Copilot host failed to initialize.')
+    set_loading_message(payload.message or 'Copilot Mesh host failed to initialize.')
     return
   elseif
     message.type == 'host.ready'
@@ -3520,7 +3520,7 @@ function M._on_event(message)
     if message.requestId and state.startup_requests[message.requestId] then
       state.startup_requests[message.requestId] = nil
       if message.requestId ~= state.startup_request_id then
-        notify(payload.message or 'Native Copilot request failed.', vim.log.levels.ERROR)
+        notify(payload.message or 'Copilot Mesh request failed.', vim.log.levels.ERROR)
         return
       end
       state.startup_request_id = nil
@@ -3534,9 +3534,9 @@ function M._on_event(message)
     end
     if loading_visible() then
       stop_loading_animation()
-      set_loading_message(payload.message or 'Native Copilot failed to initialize.')
+      set_loading_message(payload.message or 'Copilot Mesh failed to initialize.')
     end
-    notify(payload.message or 'Native Copilot request failed.', vim.log.levels.ERROR)
+    notify(payload.message or 'Copilot Mesh request failed.', vim.log.levels.ERROR)
     return
   elseif message.type == 'agents.requested' then
     local member_id = event_member(message)
@@ -3690,7 +3690,7 @@ function M._on_event(message)
   local entry = ensure_member(member_id)
   if message.type == 'startup.progress' then
     if loading_visible() and (not state.loading_target or state.loading_target == member_id) then
-      set_loading_stage(payload.message or 'Loading Native Copilot', member_id)
+      set_loading_stage(payload.message or 'Loading Copilot Mesh', member_id)
     end
   elseif message.type == 'session.history' then
     enqueue_history_render(member_id, payload)
@@ -3878,7 +3878,7 @@ function M.setup(user_options)
     conversation = options.conversation,
   })
   vim.keymap.set('n', options.mappings.toggle, M.toggle, {
-    desc = 'Toggle native Copilot',
+    desc = 'Toggle Copilot Mesh',
   })
   vim.keymap.set('n', options.mappings.fleet, M.select_agents, {
     desc = 'Select, recover, or stop Copilot agents',
@@ -3886,19 +3886,29 @@ function M.setup(user_options)
   vim.keymap.set('n', options.mappings.select, M.select, {
     desc = 'Select Copilot mode, agent, or view',
   })
-  vim.api.nvim_create_user_command('NativeCopilotToggle', M.toggle, {})
-  vim.api.nvim_create_user_command('NativeCopilotSelect', M.select_agents, {})
-  vim.api.nvim_create_user_command('NativeCopilotAgents', M.select, {})
-  vim.api.nvim_create_user_command('NativeCopilotStatus', M.show_status, {})
-  vim.api.nvim_create_user_command('NativeCopilotTasks', M.select_task, {})
-  vim.api.nvim_create_user_command('NativeCopilotAbort', M.abort, {})
-  vim.api.nvim_create_user_command('NativeCopilotCancelBackground', M.cancel_background, {})
-  vim.api.nvim_create_user_command('NativeCopilotReloadMcp', M.reload_mcp, {})
-  vim.api.nvim_create_user_command('NativeCopilotVoiceSetup', M.setup_voice, {})
+  local user_commands = {
+    Toggle = M.toggle,
+    Select = M.select_agents,
+    Agents = M.select,
+    Status = M.show_status,
+    Tasks = M.select_task,
+    Abort = M.abort,
+    CancelBackground = M.cancel_background,
+    ReloadMcp = M.reload_mcp,
+    VoiceSetup = M.setup_voice,
+  }
+  for suffix, callback in pairs(user_commands) do
+    for _, prefix in ipairs({ 'CopilotMesh', 'NativeCopilot' }) do
+      vim.api.nvim_create_user_command(prefix .. suffix, callback, {})
+    end
+  end
+  local group = vim.api.nvim_create_augroup('CopilotMesh', { clear = true })
   vim.api.nvim_create_autocmd('BufWinEnter', {
+    group = group,
     callback = function(args) buffers.on_shown(args.buf) end,
   })
   vim.api.nvim_create_autocmd({ 'CursorMoved', 'WinScrolled' }, {
+    group = group,
     callback = function(args)
       local win = args.event == 'WinScrolled' and tonumber(args.match) or nil
       if not win or not vim.api.nvim_win_is_valid(win) then
@@ -3908,6 +3918,7 @@ function M.setup(user_options)
     end,
   })
   vim.api.nvim_create_autocmd('TabClosed', {
+    group = group,
     callback = function()
       if state.tab and not vim.api.nvim_tabpage_is_valid(state.tab) then
         state.startup_request_id = nil
@@ -3921,6 +3932,7 @@ function M.setup(user_options)
     end,
   })
   vim.api.nvim_create_autocmd('VimLeavePre', {
+    group = group,
     callback = function()
       voice.shutdown()
       protocol.stop_sync(5500)

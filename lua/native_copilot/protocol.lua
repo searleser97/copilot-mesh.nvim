@@ -32,7 +32,7 @@ local function process_line(line)
   local ok, message = pcall(vim.json.decode, line)
   if not ok or type(message) ~= 'table' then
     vim.schedule(function()
-      vim.notify('Native Copilot received invalid host output. See native-copilot.log.', vim.log.levels.ERROR)
+      vim.notify('Copilot Mesh received invalid host output. See native-copilot.log.', vim.log.levels.ERROR)
     end)
     log_stderr({ 'Invalid host NDJSON: ' .. line })
     return
@@ -70,7 +70,7 @@ function M.start(opts, on_event)
   local host = plugin_root() .. '/dist/main.js'
   if vim.fn.filereadable(host) ~= 1 then
     vim.notify(
-      'Native Copilot host is not built. Run npm install && npm run build in ' .. plugin_root(),
+      'Copilot Mesh host is not built. Run npm install && npm run build in ' .. plugin_root(),
       vim.log.levels.ERROR
     )
     return false
@@ -104,13 +104,13 @@ function M.start(opts, on_event)
       state.partial = ''
       if not expected then
         vim.schedule(function()
-          vim.notify(('Native Copilot host exited with code %d.'):format(code), vim.log.levels.ERROR)
+          vim.notify(('Copilot Mesh host exited with code %d.'):format(code), vim.log.levels.ERROR)
           if state.on_event then
             state.on_event({
               v = 1,
               type = 'host.error',
               payload = {
-                message = ('Native Copilot host exited with code %d. Check native-copilot.log.'):format(
+                message = ('Copilot Mesh host exited with code %d. Check native-copilot.log.'):format(
                   code
                 ),
               },
@@ -122,7 +122,7 @@ function M.start(opts, on_event)
   })
   if state.job <= 0 then
     state.job = nil
-    vim.notify('Could not start the Native Copilot host.', vim.log.levels.ERROR)
+    vim.notify('Could not start the Copilot Mesh host.', vim.log.levels.ERROR)
     return false
   end
   return true
@@ -130,7 +130,7 @@ end
 
 function M.send(message_type, payload)
   if not M.is_running() then
-    return nil, 'Native Copilot host is not running'
+    return nil, 'Copilot Mesh host is not running'
   end
   local id = request_id()
   local encoded = vim.json.encode({
@@ -141,7 +141,7 @@ function M.send(message_type, payload)
   })
   local written = vim.fn.chansend(state.job, encoded .. '\n')
   if written == 0 then
-    return nil, 'Could not write to the Native Copilot host'
+    return nil, 'Could not write to the Copilot Mesh host'
   end
   return id
 end

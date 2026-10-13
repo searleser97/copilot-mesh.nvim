@@ -199,7 +199,7 @@ text labels for operational clarity, and every participant heading remains confi
 
 **Status:** Completed
 
-Add an insert-mode `<C-s>` mapping to submit the current Native Copilot prompt without requiring
+Add an insert-mode `<C-s>` mapping to submit the current Copilot Mesh prompt without requiring
 the user to leave insert mode.
 
 **Acceptance criteria**
@@ -213,7 +213,7 @@ the user to leave insert mode.
 
 **Status:** Completed
 
-Determine whether Native Copilot exposes a stable public function or `<Plug>` mapping that users
+Determine whether Copilot Mesh exposes a stable public function or `<Plug>` mapping that users
 can call from their own normal- and insert-mode keybindings. If it does not, design and expose one
 instead of requiring users to invoke internal callbacks.
 
@@ -223,4 +223,4 @@ instead of requiring users to invoke internal callbacks.
 - If missing, expose a supported Lua function or `<Plug>` mapping.
 - User configuration can replace or supplement the default mappings without copying internal
   prompt logic.
-- Invalid calls outside a Native Copilot prompt buffer fail safely and consistently.
+- Invalid calls outside a Copilot Mesh prompt buffer fail safely and consistently.

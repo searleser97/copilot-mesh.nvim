@@ -269,7 +269,7 @@ export class AgentDatabase {
       if (schema.version > SCHEMA_VERSION) {
         throw new Error(
           `The Copilot state database is at schema version ${schema.version}, which is newer than ` +
-            `this host understands (${SCHEMA_VERSION}). Update native-copilot.nvim instead of ` +
+            `this host understands (${SCHEMA_VERSION}). Update copilot-mesh.nvim instead of ` +
             "opening it with an older host; the newer state is left untouched.",
         );
       }
@@ -557,7 +557,7 @@ export class AgentDatabase {
       `Restart required: cannot migrate the Copilot state database from schema version ` +
         `${schemaVersion} to ${SCHEMA_VERSION} while active runs are owned by live host ` +
         `process${owners.length === 1 ? "" : "es"} ${owners.join(", ")}. Close every Neovim ` +
-        "instance using this database, then start native-copilot.nvim again. The migration was " +
+        "instance using this database, then start copilot-mesh.nvim again. The migration was " +
         "deferred without changing run, message, or delivery-lease state.",
     );
   }
@@ -837,7 +837,7 @@ export class AgentDatabase {
         throw new Error(
           `Workspace "${workspace}" has multiple session-backed generic primary identities ` +
             `during schema-v14 repair (${details}). Resolve the ambiguous persisted state ` +
-            "before starting native-copilot.nvim.",
+            "before starting copilot-mesh.nvim.",
         );
       }
 
@@ -855,7 +855,7 @@ export class AgentDatabase {
         throw new Error(
           `Workspace "${workspace}" has multiple migration-created generic primary ` +
             `identities during schema-v14 repair (${details}). Resolve the ambiguous ` +
-            "persisted state before starting native-copilot.nvim.",
+            "persisted state before starting copilot-mesh.nvim.",
         );
       }
       const existingPrimary = viablePrimary ?? migrationPrimaries[0];
@@ -1904,7 +1904,7 @@ export class AgentDatabase {
       throw new Error(
         `The Copilot state database assigns the reserved compatibility selector ` +
           `"${LEGACY_PRIMARY_IDENTITY}" as an agent alias (${details}). ` +
-          "Rename or remove the conflicting persisted agent before starting native-copilot.nvim.",
+          "Rename or remove the conflicting persisted agent before starting copilot-mesh.nvim.",
       );
     }
 
@@ -1934,7 +1934,7 @@ export class AgentDatabase {
         .join("; ");
       throw new Error(
         `The Copilot state database contains conflicting persisted agent aliases: ${details}. ` +
-          "Resolve the duplicate aliases before starting native-copilot.nvim.",
+          "Resolve the duplicate aliases before starting copilot-mesh.nvim.",
       );
     }
 
@@ -1974,7 +1974,7 @@ export class AgentDatabase {
         .join("; ");
       throw new Error(
         `The Copilot state database contains primary/non-primary alias collisions: ${details}. ` +
-          "Resolve the conflicting persisted aliases before starting native-copilot.nvim.",
+          "Resolve the conflicting persisted aliases before starting copilot-mesh.nvim.",
       );
     }
   }
@@ -2081,7 +2081,7 @@ export class AgentDatabase {
         if (this.isAliasConstraintFailure(error)) {
           throw new Error(
             "The Copilot state database contains conflicting persisted agent aliases. " +
-              "Resolve the duplicate aliases before starting native-copilot.nvim.",
+              "Resolve the duplicate aliases before starting copilot-mesh.nvim.",
             { cause: error },
           );
         }
