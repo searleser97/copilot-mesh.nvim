@@ -4,10 +4,11 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { argv, env, exit, ppid, stderr } from "node:process";
 import { z } from "zod";
-import { AgentDatabase, processIsAlive } from "./database.js";
+import { AgentDatabase, MeshHost, processIsAlive, resolveRuntimeCommand } from "copilot-mesh";
 import { Protocol, type IncomingCommand } from "./protocol.js";
-import { CopilotRuntime, resolveRuntimeCommand } from "./runtime.js";
-import type { RuntimeAdapter } from "./runtime-adapter.js";
+import type { RuntimeAdapter } from "copilot-mesh";
+import { CoreRuntime } from "./core-runtime.js";
+import { sendCoreEvent } from "./core-events.js";
 import { ScriptedRuntime } from "./scripted-runtime.js";
 import {
   PROTOCOL_VERSION,
@@ -76,11 +77,9 @@ async function main(): Promise<void> {
   const runtimeCommand = options.scriptedProfile
     ? undefined
     : await resolveRuntimeCommand(options.runtimeCommandResolver, options.workspace);
-  const db = new AgentDatabase(options.databasePath, processIsAlive);
-  const interruptedRuns = db.markInterruptedWork(
-    "Owning Neovim host is no longer running",
-    processIsAlive,
-  );
+  let db: AgentDatabase | undefined;
+  let interruptedRuns = 0;
+  let snapshot: () => ReturnType<AgentDatabase["snapshot"]>;
   let runtime: RuntimeAdapter;
   let protocol: Protocol;
   let closing: Promise<void> | undefined;
@@ -98,7 +97,7 @@ async function main(): Promise<void> {
         requestId === undefined ? { done: true } : { requestId, done: true },
       );
       protocol.stop();
-      db.close();
+      db?.close();
     })();
     return closing;
   };
@@ -122,7 +121,7 @@ async function main(): Promise<void> {
         );
         return;
       case "state.snapshot":
-        protocol.send("state.snapshot", db.snapshot(), { requestId: command.id, done: true });
+        protocol.send("state.snapshot", snapshot(), { requestId: command.id, done: true });
         return;
       case "history.chunk.rendered": {
         const replayId = requiredString(payload, "replayId", command.type);
@@ -470,9 +469,30 @@ async function main(): Promise<void> {
   }) => {
     protocol.send(type, payload, fields);
   };
-  runtime = options.scriptedProfile
-    ? new ScriptedRuntime(options.workspace, db, emit, options.scriptedProfile)
-    : new CopilotRuntime(options.workspace, db, emit, runtimeCommand, options.fileHookDirectories);
+  if (options.scriptedProfile) {
+    const scriptedDatabase = new AgentDatabase(options.databasePath, processIsAlive);
+    db = scriptedDatabase;
+    interruptedRuns = db.markInterruptedWork("Owning Neovim host is no longer running", processIsAlive);
+    snapshot = () => scriptedDatabase.snapshot();
+    runtime = new ScriptedRuntime(options.workspace, db, emit, options.scriptedProfile);
+  } else {
+    const host = new MeshHost({
+      workspace: options.workspace,
+      databasePath: options.databasePath,
+      fileHookDirectories: options.fileHookDirectories,
+      ...(runtimeCommand === undefined ? {} : { runtimeCommand }),
+      identity: {
+        clientName: "copilot-mesh.nvim",
+        primaryTask: "Assist the user in the primary Neovim conversation.",
+        primaryPrompt: "You are the Copilot agent attached to the primary user-facing Neovim buffer. " +
+          "Use the agent-management tools only when additional independent agents materially help.",
+      },
+      onEvent: (event) => sendCoreEvent(protocol, event),
+    });
+    interruptedRuns = host.interruptedRuns;
+    snapshot = () => host.snapshot();
+    runtime = new CoreRuntime(host);
+  }
 
   const parentMonitor = setInterval(() => {
     if (!processIsAlive(ppid)) {

@@ -3,10 +3,10 @@ import type {
   AgentDatabase,
   PrimaryStartupClaim,
   StoredAgentRun,
-} from "./database.js";
-import type { RuntimeAdapter } from "./runtime-adapter.js";
-import { compactHistoryEvents } from "./runtime.js";
-import type { HistoryReplayEvent } from "./runtime.js";
+} from "copilot-mesh/database";
+import type { RuntimeAdapter } from "copilot-mesh";
+import { compactHistoryEvents } from "copilot-mesh";
+import type { HistoryReplayEvent } from "copilot-mesh";
 import type { SpawnAgentsRequest } from "./types.js";
 
 interface RuntimeEmitter {

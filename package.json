@@ -2,20 +2,20 @@
   "name": "copilot-mesh.nvim",
   "version": "0.1.0",
   "private": true,
-  "description": "Copilot Mesh: a Neovim UI and durable multi-agent host for GitHub Copilot",
+  "description": "Neovim UI and process adapter for the Copilot Mesh multi-agent core",
   "type": "module",
   "engines": {
-    "node": "^20.19.0 || >=22.12.0"
+    "node": ">=22.13.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test test/database.test.mjs test/response-correlation.test.mjs test/session-health.test.mjs test/peer-steering.test.mjs test/rename-compat.test.mjs && nvim --headless -u NONE -l test/rename-compat.lua && nvim --headless -u NONE -l test/startup-picker.lua && nvim --headless -u NONE -l test/session-health.lua && nvim --headless -u NONE -l test/peer-steering.lua && python test/native_copilot_voice_test.py && pwsh -NoLogo -NoProfile -File scripts/run-visible-e2e.ps1",
+    "test": "npm run test:adapter && nvim --headless -u NONE -l test/rename-compat.lua && nvim --headless -u NONE -l test/startup-picker.lua && nvim --headless -u NONE -l test/session-health.lua && nvim --headless -u NONE -l test/peer-steering.lua && python test/native_copilot_voice_test.py && pwsh -NoLogo -NoProfile -File scripts/run-visible-e2e.ps1",
+    "test:adapter": "npm run build && node --test test/core-adapter.test.mjs test/rename-compat.test.mjs",
     "test:rename": "npm run build && node --test test/rename-compat.test.mjs && nvim --headless -u NONE -l test/rename-compat.lua",
     "test:voice": "python test/native_copilot_voice_test.py",
-    "test:session-health": "npm run build && node --test test/session-health.test.mjs && nvim --headless -u NONE -l test/session-health.lua",
-    "test:database": "npm run build && node --test test/agent-directory.test.mjs test/agent-resume.test.mjs test/database.test.mjs test/fleet-tools.test.mjs test/response-correlation.test.mjs test/session-health.test.mjs test/peer-steering.test.mjs",
-    "test:peer-steering": "npm run build && node --test test/peer-steering.test.mjs && nvim --headless -u NONE -l test/peer-steering.lua",
+    "test:session-health": "npm run build && nvim --headless -u NONE -l test/session-health.lua",
+    "test:peer-steering": "npm run build && nvim --headless -u NONE -l test/peer-steering.lua",
     "test:e2e": "npm run test",
     "test:e2e:observe": "npm run build && pwsh -NoLogo -NoProfile -File scripts/run-visible-e2e.ps1 -Profile allow-all -Observe",
     "test:e2e:allow-all": "npm run build && pwsh -NoLogo -NoProfile -File scripts/run-visible-e2e.ps1 -Profile allow-all",
@@ -24,7 +24,7 @@
     "test:e2e:telescope": "npm run build && pwsh -NoLogo -NoProfile -File scripts/run-visible-e2e.ps1 -Profile telescope"
   },
   "dependencies": {
-    "@github/copilot-sdk": "1.0.11",
+    "copilot-mesh": "git+https://github.com/searleser97/copilot-mesh.git#5f9033f37a94a94ac83684df462efdc722750731",
     "zod": "^4.3.6"
   },
   "devDependencies": {

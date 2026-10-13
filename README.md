@@ -5,17 +5,55 @@ A native Neovim interface for GitHub Copilot built around persistent UUID-backed
 - **Primary Copilot agent**: the generic agent initially attached to the main user-facing buffer. It has the same durable UUID, run, SDK session, mailbox, ACL, and activity-cursor model as every other agent, plus management capabilities.
 - **Additional agents**: independently configured Copilot sessions that run concurrently, each with its own durable identity, history, permissions, and explicit directional communication ACL.
 
-The Neovim plugin owns a local Node.js host through versioned NDJSON over stdio. The host owns the official `@github/copilot-sdk`, Copilot sessions, configuration validation, and SQLite recovery state. It is not a daemon: exiting Neovim shuts down the host and all SDK-owned Copilot processes.
+The Neovim plugin owns a local Node.js adapter through versioned NDJSON over stdio.
+The adapter embeds the separately packaged
+[copilot-mesh core](https://github.com/searleser97/copilot-mesh), which owns the
+official `@github/copilot-sdk`, sessions, durable identities/ownership, mail and
+steering, observation, permission enforcement and SQLite recovery state.
+It is not a daemon: exiting Neovim shuts down the adapter and its SDK-owned processes.
 
 ## Requirements
 
 - Neovim 0.10 or newer
-- Node.js `^20.19.0` or `>=22.12.0`
+- Node.js 22.13 or newer (including `node:sqlite`; current Node 24 recommended)
 - GitHub Copilot access and a Copilot CLI login
 - An authenticated [GitHub CLI](https://cli.github.com/) (`gh auth login`) for the built-in GitHub MCP server
 - Optional picker UI through [Telescope](https://github.com/nvim-telescope/telescope.nvim)
 
-The Copilot SDK is a local dependency of this repository. A global SDK installation is neither required nor used.
+The pinned core package brings SDK 1.0.11 as a local transitive dependency.
+A global SDK installation is neither required nor used.
+
+## Core and adapter boundary
+
+There are exactly two repositories. This repository contains the Lua UI and its
+TypeScript adapter: configuration/environment lookup, existing data paths, NDJSON
+requests, approvals, render routing, input, pickers/completion and child-process
+ownership. Core implementation and regression tests live only in `copilot-mesh`.
+The scripted runtime here is a deterministic UI test fixture, not a second real
+SDK host implementation.
+
+`src/core-runtime.ts` translates the existing request dispatcher to core API v1;
+`src/core-events.ts` translates transport-neutral domain events to the unchanged
+Neovim wire names and rendering targets. The core never reads Neovim settings,
+chooses a Neovim data directory, watches Neovim's PID or imports plugin files.
+Approvals retain their original SDK-session binding; history acknowledgements
+remain flow control and are sent by the adapter after Lua consumes each chunk.
+No permission, identity, hook/MCP policy or observation boundary is relaxed.
+
+`package.json` pins the core to an immutable GitHub commit, with the resolved
+dependency in `package-lock.json`; this is not a public npm registry release.
+`npm ci` installs and builds that independent package. To update intentionally,
+change the full core commit pin with `npm install --save-exact
+"git+https://github.com/searleser97/copilot-mesh.git#<full-commit-sha>"`, commit both
+manifest and lockfile, then rebuild the adapter. Do not use a `file:` dependency,
+sibling symlink or copied core source. See the core README for its public typed
+requests/events/approval contract and minimal non-Neovim consumer.
+
+Existing physical checkouts and Lazy names remain in place. The adapter still
+supplies `stdpath("data")/native-copilot/state.sqlite`; schema17 and all SDK session
+IDs, durable UUIDs, ACLs, history, receipts, mail and cursors are unchanged. No
+database migration, process takeover or running-host restart is needed for this
+split. Already-running hosts retain their loaded code until normally closed.
 
 ## Install
 
@@ -488,8 +526,9 @@ require("copilot_mesh").setup({
 })
 ```
 
-This list grants permission to request hooks, not automatic enablement. Direct Node hosts use the
-equivalent `NATIVE_COPILOT_FILE_HOOK_DIRECTORIES` JSON string array. Approval is exact-directory,
+This list grants permission to request hooks, not automatic enablement. The Node adapter uses the
+equivalent `NATIVE_COPILOT_FILE_HOOK_DIRECTORIES` JSON string array; independent core consumers
+pass `MeshHostOptions.fileHookDirectories` explicitly. Approval is exact-directory,
 not recursive, and canonical paths are checked again on recovery. Removing an approval prevents
 future hook-enabled connections; it does not terminate existing processes. Resume with
 `enableFileHooks: false` to persist revocation for a stopped agent.
@@ -562,7 +601,7 @@ the earlier hypothesis but is not a public SDK API or proof of the exact private
 the newer executables: the inspected 1.0.90/1.0.93 platform releases ship compiled executables,
 not that readable `app.js`. The live, plugin-independent traces establish their actual behavior.
 
-Run the opt-in diagnostic from the project directory with an explicitly chosen executable:
+Run the opt-in diagnostic from a **copilot-mesh core clone** with an explicitly chosen executable:
 
 ```powershell
 node test\native-file-hooks-lifecycle.mjs --cli (Get-Command copilot.exe).Source --model gpt-6-astra --expect-persistent
@@ -1068,7 +1107,7 @@ stdin closure, parent-process loss, `SIGINT`, and `SIGTERM` trigger the same bou
 
 ## Testing
 
-The supported test workflow combines focused Node SQLite regressions with visible UI E2E. The
+The supported test workflow combines focused Node adapter regressions with visible UI E2E. The
 visible suite launches a maximized WezTerm window with a real Neovim instance, plugin Lua, Node
 host, NDJSON protocol, SQLite database, prompt buffer, and conversation rendering. Copilot replies,
 MCP initialization, permissions, Tasks, and Tool events are scripted at the runtime boundary so
@@ -1088,21 +1127,24 @@ Run the complete visible matrix:
 npm test
 ```
 
-`npm test` first runs the Node SQLite regression suite, including schema-v13 primary repair,
-single-owner staged claims, exact predecessor cleanup, alias fallback, and dead-owner recovery.
-Run only those database regressions with:
+`npm test` first runs Node adapter and persistence-selection regressions. Run only
+those integration checks with:
 
 ```powershell
-npm run test:database
+npm run test:adapter
 ```
 
-Run the recovery/state/UI regressions with `npm run test:session-health`. The opt-in live probe
+Core SQLite, lifecycle, ACL, permission, steering and state regressions run with
+`npm test` in a **copilot-mesh core clone**. They are not copied into this plugin.
+
+Run the recovery UI regressions here with `npm run test:session-health`. The opt-in live probe
 starts its own disposable SDK process and makes three real model requests; it never attaches to
 an existing host. It holds one harmless test tool while replaying an older terminal event, then
 checks recovery with notifications withheld. Results are saved under
 `.e2e-artifacts\session-recovery-live\`.
 
 ```powershell
+Set-Location <copilot-mesh-core-clone>
 npm run build
 node test\session-recovery-live.mjs --cli (Get-Command copilot).Source
 ```
@@ -1112,13 +1154,15 @@ and the real host's legacy/default/explicit database selection. Set
 `COPILOT_MESH_LEGACY_FIRST=1` when running `test\rename-compat.lua` to check legacy-first loading.
 These tests use isolated fixtures and never open the user's state database.
 
-Run `npm run test:peer-steering` for mailbox ordering, serialization, durable receipts, lifecycle
-races, and Neovim steering/user-queue UI regressions. The opt-in live peer probe creates two new
+Run `npm run test:peer-steering` here for Neovim steering/user-queue UI regressions.
+Core tests cover mailbox ordering, serialization, durable receipts and lifecycle
+races. The opt-in live peer probe in the **core clone** creates two new
 disposable SDK sessions and calls the real `real_agent_send_message` tool while the recipient is
 inside a gated tool. It asserts that the changed instruction executes before the first idle, with
 one durable message, one acceptance, no task restart/resend, and intact sender attribution:
 
 ```powershell
+Set-Location <copilot-mesh-core-clone>
 npm run build
 node test\peer-steering-live.mjs --cli (Get-Command copilot).Source
 ```

@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
-import { AgentDatabase } from "../dist/database.js";
+import { AgentDatabase } from "copilot-mesh/database";
 
 for (const selection of ["default", "environment", "argument"]) {
   test(`renamed host preserves ${selection} database selection and stored session identity`, async (t) => {

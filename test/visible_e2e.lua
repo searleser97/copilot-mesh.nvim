@@ -964,7 +964,7 @@ tick = function()
     if not check(
       outside_submit == false
         and outside_warning
-          == 'Prompt submission is only available from the Native Copilot prompt buffer.',
+          == 'Prompt submission is only available from the Copilot Mesh prompt buffer.',
       'public prompt submission rejected calls outside the prompt buffer'
     ) then
       return
