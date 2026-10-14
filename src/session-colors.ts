@@ -49,45 +49,103 @@ export interface SessionColor {
   expiresAt: number;
 }
 
+export interface ColorState {
+  sessionId: string;
+  state: "assigned" | "expired" | "cleared";
+  color?: SessionColor;
+}
+
+export function validateSessionId(sessionId: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(sessionId)) {
+    throw new Error("sessionId must be the exact SDK conversation ID (1-200 ASCII identity characters)");
+  }
+}
+
 /** UI-only leases: separate from the core's agent database and schema. */
 export class ColorRegistry {
   private readonly db: DatabaseSync;
-  constructor(path: string) {
-    mkdirSync(dirname(path), { recursive: true });
-    this.db = new DatabaseSync(path);
+  constructor(path: string, readOnly = false) {
+    if (!readOnly) mkdirSync(dirname(path), { recursive: true });
+    this.db = new DatabaseSync(path, { readOnly });
     try {
       this.db.exec("PRAGMA busy_timeout=5000");
-      this.db.exec(`CREATE TABLE IF NOT EXISTS session_colors (
+      if (!readOnly) this.db.exec(`CREATE TABLE IF NOT EXISTS session_colors (
         session_id TEXT PRIMARY KEY,
         color TEXT NOT NULL CHECK(length(color) = 7),
         last_activity INTEGER NOT NULL
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS session_color_cleared (
+        session_id TEXT PRIMARY KEY
       ) STRICT`);
     } catch (error) {
       this.db.close();
       throw error;
     }
   }
-  reserve(sessionId: string, now = Date.now()): SessionColor {
-    if (!sessionId.trim() || !Number.isSafeInteger(now) || now < 0) {
+  private read(now: number) {
+    if (!Number.isSafeInteger(now) || now < 0) {
       throw new Error("Invalid session color identity or activity timestamp");
     }
+    const rows = this.db.prepare("SELECT session_id, color, last_activity FROM session_colors").all();
+    const cleared = this.db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='session_color_cleared'",
+    ).get() ? this.db.prepare("SELECT session_id FROM session_color_cleared").all() : [];
+    for (const row of [...rows, ...cleared]) {
+      if (typeof row.session_id !== "string") throw new Error("Corrupt session color identity");
+      validateSessionId(row.session_id);
+    }
+    const entries = rows.map(row => {
+      if (typeof row.color !== "string" || !/^#[0-9a-f]{6}$/.test(row.color) ||
+        typeof row.last_activity !== "number" || !Number.isSafeInteger(row.last_activity) ||
+        row.last_activity < 0) throw new Error("Corrupt session color reservation");
+      return { sessionId: String(row.session_id), bg: row.color, fg: foreground(row.color),
+        expiresAt: row.last_activity + LEASE_MS };
+    });
+    const optOut = new Set(cleared.map(row => String(row.session_id)));
+    const active = entries.filter(row => row.expiresAt > now && !optOut.has(row.sessionId));
+    if (new Set(active.map(row => row.bg)).size !== active.length) {
+      throw new Error("Conflicting session color reservations");
+    }
+    return { entries, active, optOut };
+  }
+  get(sessionId: string, now = Date.now()): ColorState {
+    validateSessionId(sessionId);
+    // Keep the two tables consistent even when another process clears/sets concurrently.
+    this.db.exec("BEGIN");
+    try {
+      const { entries, optOut } = this.read(now);
+      const color = entries.find(row => row.sessionId === sessionId);
+      if (!color && !optOut.has(sessionId)) throw new Error("Unknown main session color identity");
+      const result: ColorState = optOut.has(sessionId) ? { sessionId, state: "cleared" }
+        : { sessionId, state: color!.expiresAt > now ? "assigned" : "expired", color: color! };
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+  private write(sessionId: string, mode: "reserve" | "set" | "clear", now: number,
+    requested?: string): SessionColor | undefined {
+    validateSessionId(sessionId);
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const rows = this.db.prepare("SELECT session_id, color, last_activity FROM session_colors").all();
-      for (const row of rows) {
-        if (typeof row.session_id !== "string" || !row.session_id.trim() ||
-          typeof row.color !== "string" || !candidates.includes(row.color) ||
-          typeof row.last_activity !== "number" || !Number.isSafeInteger(row.last_activity) ||
-          row.last_activity < 0) throw new Error("Corrupt session color reservation");
+      const { entries, active, optOut } = this.read(now);
+      const own = entries.find(row => row.sessionId === sessionId);
+      if (mode !== "reserve" && !own && !optOut.has(sessionId)) {
+        throw new Error("Unknown main session color identity; open it in Copilot Mesh first");
       }
-      const own = rows.find(row => row.session_id === sessionId);
-      const active = rows.filter(row => Number(row.last_activity) > now - LEASE_MS);
-      if (new Set(active.map(row => row.color)).size !== active.length) {
-        throw new Error("Conflicting session color reservations");
+      if (mode === "clear") {
+        this.db.prepare("DELETE FROM session_colors WHERE session_id = ?").run(sessionId);
+        this.db.prepare("INSERT OR IGNORE INTO session_color_cleared VALUES (?)").run(sessionId);
       }
-      const live = active.filter(row => row.session_id !== sessionId);
-      const used = new Set(live.map(row => String(row.color)));
-      let color = own && !used.has(String(own.color)) ? String(own.color) : undefined;
+      if (mode === "clear" || (mode === "reserve" && optOut.has(sessionId))) {
+        this.db.exec("COMMIT");
+        return undefined;
+      }
+      const used = new Set(active.filter(row => row.sessionId !== sessionId).map(row => row.bg));
+      if (requested && used.has(requested)) throw new Error("Requested color has an active lease for another session");
+      let color = requested ?? (own && !used.has(own.bg) ? own.bg : undefined);
       if (!color) color = curated.find(candidate => !used.has(candidate));
       if (!color) {
         const labs = [...used].map(lab);
@@ -101,7 +159,8 @@ export class ColorRegistry {
         }
       }
       if (!color) throw new Error(`All ${COLOR_CAPACITY} session colors have active seven-day leases`);
-      const activity = Math.max(now, Number(own?.last_activity ?? 0));
+      const activity = Math.max(now, own ? own.expiresAt - LEASE_MS : 0);
+      this.db.prepare("DELETE FROM session_color_cleared WHERE session_id = ?").run(sessionId);
       this.db.prepare(`INSERT INTO session_colors VALUES (?, ?, ?)
         ON CONFLICT(session_id) DO UPDATE SET color=excluded.color, last_activity=excluded.last_activity`)
         .run(sessionId, color, activity);
@@ -112,6 +171,14 @@ export class ColorRegistry {
       throw error;
     }
   }
+  reserve(sessionId: string, now = Date.now()): SessionColor | undefined {
+    return this.write(sessionId, "reserve", now);
+  }
+  set(sessionId: string, color: string, now = Date.now()): SessionColor {
+    if (!/^#[0-9a-fA-F]{6}$/.test(color)) throw new Error("color must be a six-digit RGB hex value, for example #56b4e9");
+    return this.write(sessionId, "set", now, color.toLowerCase())!;
+  }
+  clear(sessionId: string, now = Date.now()): void { this.write(sessionId, "clear", now); }
   close(): void { this.db.close(); }
 }
 
@@ -125,8 +192,13 @@ export class SessionColors {
   private primary: { sessionId: string; target: string; runId: string | undefined } | undefined;
   private color: SessionColor | undefined;
   private lastAttempt = -Infinity;
+  private lastError: string | undefined;
+  private readonly observer: ReturnType<typeof setInterval>;
   constructor(private readonly path: string | undefined, private readonly send: Send,
-    private readonly clock = Date.now) {}
+    private readonly clock = Date.now) {
+    this.observer = setInterval(() => this.refresh(), 250);
+    this.observer.unref();
+  }
 
   event(type: string, payload: unknown, context?: { memberId?: string; runId?: string }): void {
     if (!this.path) return;
@@ -156,17 +228,36 @@ export class SessionColors {
     try {
       this.registry ??= new ColorRegistry(this.path);
       this.color = this.registry.reserve(this.primary.sessionId, this.lastAttempt);
+      this.lastError = undefined;
       this.replay();
     } catch (error) {
-      this.color = undefined;
-      this.send("session.color", {});
-      this.send("session.color.error", {
-        message: `Session color registry ${this.path}: ${error instanceof Error ? error.message : String(error)}`,
-      });
+      this.report(error);
     }
+  }
+  /** Observe external MCP edits and other windows without treating reads as activity. */
+  refresh(): void {
+    if (!this.primary || !this.registry) return;
+    try {
+      const state = this.registry.get(this.primary.sessionId, this.clock());
+      const color = state.state === "assigned" ? state.color : undefined;
+      const changed = JSON.stringify(color) !== JSON.stringify(this.color);
+      this.color = color;
+      this.lastError = undefined;
+      if (changed) this.replay();
+    } catch (error) {
+      this.report(error);
+    }
+  }
+  private report(error: unknown): void {
+    const hadColor = this.color !== undefined;
+    this.color = undefined;
+    const message = `Session color registry ${this.path}: ${error instanceof Error ? error.message : String(error)}`;
+    if (hadColor || message !== this.lastError) this.send("session.color", {});
+    if (message !== this.lastError) this.send("session.color.error", { message });
+    this.lastError = message;
   }
   replay(): void {
     this.send("session.color", this.color && this.color.expiresAt > this.clock() ? this.color : {});
   }
-  close(): void { this.registry?.close(); }
+  close(): void { clearInterval(this.observer); this.registry?.close(); }
 }

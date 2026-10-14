@@ -79,7 +79,9 @@ simultaneous restoration of the same conversation. Twelve curated colors are
 followed by farthest-distance selections in OKLab from a fixed RGB grid (228
 colors total). Black/white text is selected for at least 4.5:1 contrast. Large
 populations are not guaranteed perceptually distinct; capacity exhaustion and
-storage errors are reported, never silently assigned colliding colors.
+storage errors are reported, never silently assigned colliding colors. Explicit MCP
+color selections may use any six-digit RGB color; the 228-color limit applies to
+automatic selection, not to that manual override.
 
 When true color (`termguicolors`) and an already-loaded, compatible lualine are available, the plugin tints its
 existing center/fill background only in the Mesh tab, including inactive splits.
@@ -94,6 +96,66 @@ plugin never loads lualine itself, changes `termguicolors`, or substitutes anoth
 allocation/display; `session_colors.database_path` optionally overrides the shared
 registry (useful for isolated tests). Reconfigure the host only after a normal
 shutdown when changing this path or enabling/disabling allocation.
+
+### Optional statusline MCP server
+
+The built plugin includes a standalone stdio MCP server. Add an entry like this
+to your own MCP configuration when desired (the plugin does not edit it):
+
+```json
+{
+  "mcpServers": {
+    "copilot-mesh": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "C:\\Users\\YOUR_USER\\AppData\\Local\\nvim-data\\lazy\\native-copilot.nvim\\dist\\statusline-mcp.js"
+      ],
+      "tools": ["*"]
+    }
+  }
+}
+```
+
+Use your actual installed plugin directory; the legacy `native-copilot.nvim`
+directory above is intentional. Build with `npm run build` first. The server
+uses the same default per-user registry as the plugin. If you configured a
+different `session_colors.database_path`, supply that exact path using the
+server's `--database` argument or `NATIVE_COPILOT_COLOR_DATABASE` environment
+variable. No daemon, network listener, SDK upgrade, or core database change is
+involved. Existing MCP clients must reload their configuration normally to
+discover these tools; installing the plugin does not load tools into an
+already-running Copilot session.
+
+| Tool | Required arguments | Effect |
+|---|---|---|
+| `copilot-mesh-get-statusline-color` | `sessionId` | Read `assigned`, `expired`, or `cleared` state, including the color and expiry where applicable. Does not create a registry, allocate, or renew. |
+| `copilot-mesh-set-statusline-color` | `sessionId`, `color` | Choose `#RRGGBB` (case-insensitive), renew the lease, and select readable black/white text. Reject a color leased to another conversation. Explicitly re-enable a cleared tint. |
+| `copilot-mesh-clear-statusline-color` | `sessionId` | Free the reservation and persistently opt out of tinting. Activity and reopening do not undo this; only an explicit `set` does. |
+
+**Session targeting is deliberately caller-supplied, not authenticated.** Use
+the stable SDK conversation ID, not the Mesh agent UUID, run ID, target, or
+alias. Copilot can obtain the `sessionId` field from the existing
+`real_agent_get` tool using its *known actual own Mesh alias* (`copilot` for the
+default primary). Never guess that alias when identity is uncertain: obtain
+the intended session ID from the user instead. No "latest" or foreground-window
+heuristic is used. The target must already be known to this color registry from
+opening a main conversation in the plugin; unknown IDs fail rather than creating
+reservations. This is not a security boundary: a caller supplying another known
+main ID can change its color. Subagents are instructed not to call these tools,
+but that restriction cannot be enforced by a standalone server with an explicit
+ID parameter. An old main ID remains known even if later adopted as a child.
+
+Updated plugin hosts observe the registry read-only every 250ms and refresh the
+existing statusline colors for their current main conversation, including other
+windows showing the same SDK ID. These reads do not extend leases. `clear`
+restores the underlying provider colors and `set` updates the tint without
+changing any text, components, or layout. Tool results always say
+`display: "not-verified"`: the standalone server cannot know whether a particular
+window has a compatible loaded lualine, true color enabled, or tinting disabled.
+Unsupported providers remain silent no-ops. Open a new Neovim instance to load
+the updated adapter; hosts already running older code are not hot-patched and
+do not implement MCP refresh or persistent opt-out.
 
 ## Install
 
