@@ -3,6 +3,7 @@ local buffers = require('native_copilot.buffers')
 local commands = require('native_copilot.commands')
 local clipboard = require('native_copilot.clipboard')
 local voice = require('native_copilot.voice')
+local statusline = require('copilot_mesh.statusline')
 
 local M = {}
 local data_root = vim.fn.stdpath('data')
@@ -62,6 +63,7 @@ local defaults = {
   runtime_command_resolver = vim.env.NVIM_COPILOT_CMD_RESOLVER,
   file_hook_directories = {},
   database_path = default_database,
+  session_colors = { enabled = true, database_path = nil },
   workspace = nil,
   prompt_height = 8,
   prompt_queue_height = 5,
@@ -1994,6 +1996,7 @@ local function start_host()
     runtime_command_resolver = options.runtime_command_resolver,
     file_hook_directories = options.file_hook_directories,
     database_path = options.database_path,
+    session_colors = options.session_colors,
     workspace = current_workspace(),
   }, M._on_event)
 end
@@ -2923,6 +2926,15 @@ end
 
 function M._on_event(message)
   local payload = message.payload or {}
+  if message.type == 'session.color' then statusline.update(payload); return end
+  if message.type == 'session.color.error' then
+    notify(payload.message, vim.log.levels.ERROR)
+    return
+  end
+  if message.type == 'host.error' or message.type == 'host.shutdown'
+    or message.type == 'session.loading'
+    or (message.type == 'agent.loading' and payload.primary)
+  then statusline.clear() end
   if message.type == 'request.complete' and message.requestId then
     state.startup_requests[message.requestId] = nil
   end
@@ -3870,6 +3882,10 @@ end
 
 function M.setup(user_options)
   options = vim.tbl_deep_extend('force', vim.deepcopy(defaults), user_options or {})
+  statusline.setup(options.session_colors, function(win)
+    return state.tab ~= nil and vim.api.nvim_win_is_valid(win)
+      and vim.api.nvim_win_get_tabpage(win) == state.tab
+  end)
   buffers.setup({
     stream_flush_ms = options.stream_flush_ms,
     follow_bottom = options.follow_bottom,
@@ -3941,6 +3957,7 @@ function M.setup(user_options)
 end
 
 function M.shutdown()
+  statusline.clear()
   voice.shutdown()
   protocol.stop_sync(5500)
 end

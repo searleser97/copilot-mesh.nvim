@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { argv, env, exit, ppid, stderr } from "node:process";
 import { z } from "zod";
 import { AgentDatabase, MeshHost, processIsAlive, resolveRuntimeCommand } from "copilot-mesh";
@@ -10,6 +10,7 @@ import type { RuntimeAdapter } from "copilot-mesh";
 import { CoreRuntime } from "./core-runtime.js";
 import { sendCoreEvent } from "./core-events.js";
 import { ScriptedRuntime } from "./scripted-runtime.js";
+import { defaultColorDatabase, SessionColors } from "./session-colors.js";
 import {
   PROTOCOL_VERSION,
   type DynamicAgentDefinition,
@@ -83,6 +84,7 @@ async function main(): Promise<void> {
   let runtime: RuntimeAdapter;
   let protocol: Protocol;
   let closing: Promise<void> | undefined;
+  let colors: SessionColors;
 
   const close = (reason: string, requestId?: string): Promise<void> => {
     if (closing) {
@@ -97,6 +99,7 @@ async function main(): Promise<void> {
         requestId === undefined ? { done: true } : { requestId, done: true },
       );
       protocol.stop();
+      colors.close();
       db?.close();
     })();
     return closing;
@@ -106,6 +109,7 @@ async function main(): Promise<void> {
     const payload = objectPayload(command);
     switch (command.type) {
       case "hello":
+        colors.replay();
         protocol.send(
           "hello",
           {
@@ -459,6 +463,13 @@ async function main(): Promise<void> {
     await close("stdin closed");
     exit(0);
   });
+  colors = new SessionColors(
+    env.NATIVE_COPILOT_SESSION_COLORS === "0" ? undefined
+      : env.NATIVE_COPILOT_COLOR_DATABASE || (options.scriptedProfile
+        ? resolve(dirname(options.databasePath), "session-colors.sqlite")
+        : defaultColorDatabase()),
+    (type, payload) => protocol.send(type, payload),
+  );
   const emit = (type: string, payload?: unknown, fields?: {
     requestId?: string;
     runId?: string;
@@ -468,6 +479,7 @@ async function main(): Promise<void> {
     done?: boolean;
   }) => {
     protocol.send(type, payload, fields);
+    colors.event(type, payload, fields);
   };
   if (options.scriptedProfile) {
     const scriptedDatabase = new AgentDatabase(options.databasePath, processIsAlive);
@@ -487,7 +499,10 @@ async function main(): Promise<void> {
         primaryPrompt: "You are the Copilot agent attached to the primary user-facing Neovim buffer. " +
           "Use the agent-management tools only when additional independent agents materially help.",
       },
-      onEvent: (event) => sendCoreEvent(protocol, event),
+      onEvent: (event) => {
+        sendCoreEvent(protocol, event);
+        colors.event(event.type, event.payload, event.context);
+      },
     });
     interruptedRuns = host.interruptedRuns;
     snapshot = () => host.snapshot();

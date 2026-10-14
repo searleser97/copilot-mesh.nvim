@@ -10,8 +10,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run test:adapter && nvim --headless -u NONE -l test/rename-compat.lua && nvim --headless -u NONE -l test/startup-picker.lua && nvim --headless -u NONE -l test/session-health.lua && nvim --headless -u NONE -l test/peer-steering.lua && python test/native_copilot_voice_test.py && pwsh -NoLogo -NoProfile -File scripts/run-visible-e2e.ps1",
-    "test:adapter": "npm run build && node --test test/core-adapter.test.mjs test/rename-compat.test.mjs",
+    "test": "npm run test:adapter && npm run test:statusline && nvim --headless -u NONE -l test/rename-compat.lua && nvim --headless -u NONE -l test/startup-picker.lua && nvim --headless -u NONE -l test/session-health.lua && nvim --headless -u NONE -l test/peer-steering.lua && python test/native_copilot_voice_test.py && pwsh -NoLogo -NoProfile -File scripts/run-visible-e2e.ps1",
+    "test:adapter": "npm run build && node --test test/core-adapter.test.mjs test/rename-compat.test.mjs test/session-colors.test.mjs",
+    "test:statusline": "nvim --headless -u NONE -l test/statusline.lua",
     "test:rename": "npm run build && node --test test/rename-compat.test.mjs && nvim --headless -u NONE -l test/rename-compat.lua",
     "test:voice": "python test/native_copilot_voice_test.py",
     "test:session-health": "npm run build && nvim --headless -u NONE -l test/session-health.lua",

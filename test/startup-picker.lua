@@ -13,7 +13,10 @@ package.loaded['native_copilot.protocol'] = {
   stop_sync = function() running = false end,
 }
 local native = require('native_copilot')
-native.setup({ voice = { preload = false }, file_hook_directories = { [[E:\sydney2]] } })
+native.setup({
+  voice = { preload = false }, file_hook_directories = { [[E:\sydney2]] },
+  session_colors = { database_path = 'isolated-colors.sqlite' },
+})
 local choices = {}
 vim.ui.select = function(items, opts, callback)
   table.insert(choices, { items = items, opts = opts, choose = callback })
@@ -37,6 +40,7 @@ local sessions = {
 
 native.open({ reuse_current_tab = true })
 assert(vim.deep_equal(started_options.file_hook_directories, { [[E:\sydney2]] }))
+assert(started_options.session_colors.database_path == 'isolated-colors.sqlite')
 assert(sent[1].type == 'hello' and sent[2].type == 'sessions.list')
 local stale = last_request()
 native.open()

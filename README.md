@@ -55,6 +55,46 @@ IDs, durable UUIDs, ACLs, history, receipts, mail and cursors are unchanged. No
 database migration, process takeover or running-host restart is needed for this
 split. Already-running hosts retain their loaded code until normally closed.
 
+## Main-session statusline colors
+
+The Neovim adapter reserves a shared color for each successfully opened **main SDK
+conversation ID**, not for a host process, workspace, role alias, or subagent.
+Opening/focusing child panes keeps the main conversation's identity. No color is
+allocated while choosing a session or replaying its history.
+
+Colors are seven-day activity leases. Opening/restoring the main conversation or
+its live prompt, answer, reasoning, or tool activity renews the lease (writes are
+throttled to once per minute during a turn). Statusline redraws, history replay,
+status polling and child-only activity do not renew it. Expired colors become
+available lazily on allocation. Restoring an expired conversation keeps its old
+color only if available; otherwise it receives another color without displacing
+a current lease. An idle open window stops displaying an expired color; its next
+main-session activity atomically reacquires a lease.
+
+The UI-only SQLite registry is `%LOCALAPPDATA%\copilot-mesh.nvim\session-colors.sqlite`
+on Windows, or `$XDG_STATE_HOME/copilot-mesh.nvim/session-colors.sqlite` (default
+`~/.local/state`) elsewhere. It is independent of Neovim data profiles and the
+core's database. Transactions serialize cross-process allocation, including
+simultaneous restoration of the same conversation. Twelve curated colors are
+followed by farthest-distance selections in OKLab from a fixed RGB grid (228
+colors total). Black/white text is selected for at least 4.5:1 contrast. Large
+populations are not guaranteed perceptually distinct; capacity exhaustion and
+storage errors are reported, never silently assigned colliding colors.
+
+When true color (`termguicolors`) and an already-loaded, compatible lualine are available, the plugin tints its
+existing center/fill background only in the Mesh tab, including inactive splits.
+It changes only foreground/background colors: no configuration files, theme
+settings, text, components, separators, layout, or mode cues are replaced. Manual
+theme changes and colorscheme refreshes retain the tint; ordinary editing tabs
+and shutdown/failed startup use the original colors. No Neovim configuration edit
+is needed. Absent, unloaded, or unsupported providers silently do nothing; the
+plugin never loads lualine itself, changes `termguicolors`, or substitutes another statusline.
+
+`setup({ session_colors = { enabled = false } })` disables
+allocation/display; `session_colors.database_path` optionally overrides the shared
+registry (useful for isolated tests). Reconfigure the host only after a normal
+shutdown when changing this path or enabling/disabling allocation.
+
 ## Install
 
 Build the host:

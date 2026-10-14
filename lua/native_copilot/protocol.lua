@@ -87,6 +87,8 @@ function M.start(opts, on_event)
   }
   local host_env = {
     NATIVE_COPILOT_FILE_HOOK_DIRECTORIES = vim.json.encode(opts.file_hook_directories or {}),
+    NATIVE_COPILOT_SESSION_COLORS = (opts.session_colors or {}).enabled == false and '0' or '1',
+    NATIVE_COPILOT_COLOR_DATABASE = (opts.session_colors or {}).database_path or '',
   }
   if opts.runtime_command_resolver then
     host_env.NATIVE_COPILOT_RUNTIME_COMMAND_RESOLVER = opts.runtime_command_resolver
