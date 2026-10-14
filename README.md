@@ -1052,6 +1052,9 @@ following would push that line outside the viewport, the cursor advances to the 
 so the transcript can keep following EOF. Explicit cursor movement or scrolling away disables
 following; moving the cursor to EOF restores it. `bottom_padding` controls the preferred display
 rows below followed output, and `follow_bottom = false` disables automatic viewport following.
+Switching reuses the existing conversation buffers and fold metadata. Fold setup leaves unchanged
+window options alone and calls the Lua fold function directly, avoiding redundant full-transcript
+fold recalculation and per-line module-table conversion.
 
 Conversation turns and timeline rows show local timestamps. Tool rows show their lifetime in place
 as `[start - …]` while running and `[start - end]` when terminal; their status is represented only
@@ -1250,6 +1253,9 @@ Set-Location <copilot-mesh-core-clone>
 npm run build
 node test\session-recovery-live.mjs --cli (Get-Command copilot).Source
 ```
+
+Run `npm run test:agent-switch` for actual bracket-key switching, the per-line fold-call budget,
+native reasoning folds, prompt preservation, following, streaming/replay updates, and overview windows.
 
 Run `npm run test:rename` for shared Lua module identity, command aliases, idempotent setup,
 and the real host's legacy/default/explicit database selection. Set

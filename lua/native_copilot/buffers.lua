@@ -258,17 +258,17 @@ end
 
 local function configure_folds(view)
   if view.id ~= 'conversation' then return end
-  local foldexpr = 'v:lua.require("native_copilot.buffers").foldexpr(v:lnum)'
+  local foldexpr = "v:lua.require'native_copilot.buffers'.foldexpr(v:lnum)"
   for _, win in ipairs(vim.fn.win_findbuf(view.buf)) do
     if vim.api.nvim_win_is_valid(win) then
       local first_setup = vim.wo[win].foldmethod ~= 'expr'
         or vim.wo[win].foldexpr ~= foldexpr
-      vim.wo[win].foldmethod = 'expr'
-      vim.wo[win].foldexpr = foldexpr
+      if vim.wo[win].foldmethod ~= 'expr' then vim.wo[win].foldmethod = 'expr' end
+      if vim.wo[win].foldexpr ~= foldexpr then vim.wo[win].foldexpr = foldexpr end
       if first_setup then vim.wo[win].foldlevel = 99 end
-      vim.wo[win].foldminlines = 0
-      vim.wo[win].foldenable = true
-      vim.wo[win].signcolumn = 'yes:1'
+      if vim.wo[win].foldminlines ~= 0 then vim.wo[win].foldminlines = 0 end
+      if not vim.wo[win].foldenable then vim.wo[win].foldenable = true end
+      if vim.wo[win].signcolumn ~= 'yes:1' then vim.wo[win].signcolumn = 'yes:1' end
     end
   end
 end
