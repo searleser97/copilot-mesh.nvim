@@ -55,10 +55,8 @@ async function handle(command: IncomingCommand): Promise<void> {
   }
   if (command.type === "sessions.list") {
     const state = await client.snapshot();
-    const sessions = state.state.sessions.map(s => {
-      const run = state.state.runs.find(r => r.id === s.runId);
-      const live = state.status.agents.find(a => a.sessionId === s.sessionId);
-      return { ...s, summary: `${live ? "[Attach live]" : "[Resume stopped]"} ${live?.displayName ?? run?.alias ?? s.sessionId}`,
+    const sessions = state.conversations.map(s => {
+      return { ...s, summary: `${s.live ? "[Attach live]" : "[Resume stopped]"} ${s.displayName}`,
         inUse: false, modifiedAgoSeconds: 0 };
     });
     protocol.send("sessions.list", { sessions }, { requestId: command.id, done: true }); return;
@@ -67,7 +65,7 @@ async function handle(command: IncomingCommand): Promise<void> {
     const id = field("sessionId");
     let state = await client.snapshot();
     if (!state.status.agents.some(a => a.sessionId === id)) {
-      const stored = state.state.sessions.find(s => s.sessionId === id);
+      const stored = state.conversations.find(s => s.sessionId === id);
       if (!stored) throw new Error("Session is not managed by this shared host.");
       await rpc(command, "resumeSession", [stored.runId]);
       state = await snapshot();

@@ -26,7 +26,7 @@
     "test:e2e:telescope": "npm run build && pwsh -NoLogo -NoProfile -File scripts/run-visible-e2e.ps1 -Profile telescope"
   },
   "dependencies": {
-    "copilot-mesh": "git+https://github.com/searleser97/copilot-mesh.git#1a0c295",
+    "copilot-mesh": "git+https://github.com/searleser97/copilot-mesh.git#61f1812",
     "zod": "^4.3.6"
   },
   "devDependencies": {
