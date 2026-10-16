@@ -99,6 +99,7 @@ async function handle(command: IncomingCommand): Promise<void> {
     return;
   }
   const simple: Record<string, { method: SharedMethod; args: unknown[] }> = {
+    "shared.rename": { method: "renameConversation", args: [p.target, p.title] },
     "prompt.send": { method: "sendUserPrompt", args: [p.target, p.content] },
     "session.abort": { method: "abort", args: [p.target] },
     "agent.resume": { method: "resumeSession", args: [p.runId] },

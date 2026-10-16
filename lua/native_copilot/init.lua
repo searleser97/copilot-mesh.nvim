@@ -152,6 +152,7 @@ local state = {
   shared_drafts = {},
   shared_cursor = 0,
   shared_journal_id = '',
+  shared_titles = {},
   queued_prompts = {},
   prompt_queue_paused = {},
   prompt_queue_edit = nil,
@@ -1998,7 +1999,13 @@ local function ensure_ui(reuse_current_tab)
   if options.shared_host then
     require('native_copilot.shared_sidebar').show(state.main_win, function(chat)
       M.show_member(chat.target)
-    end, function() send('mode.primary') end)
+    end, function() send('mode.primary') end, function(chat)
+      vim.ui.input({ prompt = 'Chat title: ', default = chat.displayName }, function(title)
+        if title and vim.trim(title) ~= '' then
+          send('shared.rename', { target = chat.target, title = vim.trim(title) })
+        end
+      end)
+    end)
   end
   vim.api.nvim_set_current_win(state.prompt_win)
   prewarm_voice()
@@ -2992,7 +2999,12 @@ function M._on_event(message)
     return
   elseif message.type == 'shared.catalog' then
     if options.shared_host then
+      for _, chat in ipairs(payload.conversations or {}) do
+        state.shared_titles[chat.target] = chat.displayName
+        if buffers.get_member(chat.target) then buffers.ensure_member(chat.target, chat.displayName) end
+      end
       require('native_copilot.shared_sidebar').update(payload.conversations or {})
+      update_prompt_label()
     end
     return
   elseif message.type == 'shared.selected' then
@@ -3054,6 +3066,7 @@ function M._on_event(message)
     for _, agent in ipairs(status.agents or {}) do
       local target = agent.target or agent.id
       if target then
+        if options.shared_host and state.shared_titles[target] then agent.displayName = state.shared_titles[target] end
         if agent.primary or agent.agentId == status.primaryAgentId then set_primary(agent) end
         reported_agents[target] = true
         state.agents[target] = vim.deepcopy(agent)

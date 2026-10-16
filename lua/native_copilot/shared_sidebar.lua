@@ -3,7 +3,7 @@ local state = { conversations = {}, rows = {} }
 
 local function render()
   if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then return end
-  local lines = { 'Running chats', 'Enter: open  n: new', '' }
+  local lines = { 'Running chats', 'Enter: open  n: new  r: rename', '' }
   state.rows = {}
   for _, chat in ipairs(state.conversations) do
     if chat.live then
@@ -28,7 +28,7 @@ function M.is_window(win)
   return win == state.win and vim.api.nvim_win_is_valid(win)
 end
 
-function M.show(main_win, select, create)
+function M.show(main_win, select, create, rename)
   if state.win and vim.api.nvim_win_is_valid(state.win) then return end
   if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then
     state.buf = vim.api.nvim_create_buf(false, true)
@@ -42,6 +42,10 @@ function M.show(main_win, select, create)
       if chat then select(chat) end
     end, { buffer = state.buf, desc = 'Attach hosted conversation' })
     vim.keymap.set('n', 'n', create, { buffer = state.buf, desc = 'New hosted conversation' })
+    vim.keymap.set('n', 'r', function()
+      local chat = state.rows[vim.api.nvim_win_get_cursor(0)[1]]
+      if chat and rename then rename(chat) end
+    end, { buffer = state.buf, desc = 'Rename hosted conversation' })
   end
   local previous = vim.api.nvim_get_current_win()
   vim.api.nvim_set_current_win(main_win)
