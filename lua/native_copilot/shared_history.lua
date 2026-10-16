@@ -1,5 +1,6 @@
 local M = {}
 local chats = {}
+local journal
 local send
 local buffers = require('native_copilot.buffers')
 
@@ -16,11 +17,13 @@ local function render(target, first)
   for _, win in ipairs(vim.fn.win_findbuf(buf)) do
     local view = vim.api.nvim_win_call(win, vim.fn.winsaveview)
     local anchor, offset
+    local closed = {}
     for _, record in ipairs(state.order or {}) do
       local line = state.lines and state.lines[record.id]
       if line and line <= view.topline then anchor, offset = record.id, view.topline - line end
+      if line and vim.api.nvim_win_call(win, function() return vim.fn.foldclosed(line) end) == line then closed[record.id] = true end
     end
-    saved[win] = { view = view, anchor = anchor, offset = offset,
+    saved[win] = { view = view, anchor = anchor, offset = offset, closed = closed,
       bottom = view.topline + vim.api.nvim_win_get_height(win) >= vim.api.nvim_buf_line_count(buf) }
   end
   state.order = {}
@@ -46,6 +49,16 @@ local function render(target, first)
   for win, item in pairs(saved) do
     if vim.api.nvim_win_is_valid(win) then
       vim.api.nvim_win_call(win, function()
+        vim.wo.foldmethod = 'manual'
+        vim.cmd('normal! zE')
+        for index, record in ipairs(state.order) do
+          local start = state.lines[record.id]
+          local finish = state.order[index + 1] and state.lines[state.order[index + 1].id] - 2 or #lines - 1
+          if finish > start and (record.kind == 'tool' or record.kind == 'reasoning' or record.kind == 'event') then
+            vim.cmd(('%d,%dfold'):format(start, finish))
+            if not item.closed[record.id] then vim.cmd(start .. 'foldopen') end
+          end
+        end
         if first or item.bottom then
           vim.api.nvim_win_set_cursor(win, { #lines, 0 })
           vim.cmd('normal! zb')
@@ -62,7 +75,7 @@ local function render(target, first)
 end
 
 function M.setup(sender) send = sender end
-function M.reset() chats = {} end
+function M.reset(id) chats, journal = {}, id end
 
 function M.load(target, older)
   local state = chat(target)
@@ -83,6 +96,8 @@ end
 function M.shown(target)
   local buf = buffers.buffer(target)
   if not buf then return end
+  local state = chat(target)
+  if state.saved then vim.fn.winrestview(state.saved) end
   vim.keymap.set('n', 'gR', function() retry(target) end, { buffer = buf, desc = 'Retry/load older shared history' })
   vim.keymap.set('n', 'gH', function()
     local state, current = chat(target), vim.api.nvim_win_get_cursor(0)[1]
@@ -96,6 +111,7 @@ function M.shown(target)
     end
   end, { buffer = buf, desc = 'Load next part of shared record' })
   M.load(target, false)
+  if chat(target).loaded then render(target, false) end
 end
 
 function M.moved(win)
@@ -103,6 +119,7 @@ function M.moved(win)
   local buf = vim.api.nvim_win_get_buf(win)
   for target, state in pairs(chats) do
     if buffers.buffer(target) == buf and state.loaded and not state.error then
+      state.saved = vim.api.nvim_win_call(win, vim.fn.winsaveview)
       local top = vim.api.nvim_win_call(win, function() return vim.fn.line('w0') end)
       if top <= 30 then M.load(target, true) end
     end
@@ -111,11 +128,12 @@ end
 
 function M.event(message)
   local target, payload = message.memberId, message.payload or {}
+  if payload.journalId and journal and payload.journalId ~= journal then return end
   if not target or not chats[target] then return end
   local state = chat(target)
   if message.type == 'shared.history.changed' then
     for _, id in ipairs(payload.ids or {}) do state.pending[id] = true end
-    if #payload.ids > 0 then send('shared.history.records', { target = target, ids = payload.ids }) end
+    if #(payload.ids or {}) > 0 then send('shared.history.records', { target = target, ids = payload.ids }) end
     return
   elseif message.type == 'shared.history.error' then
     state.loading, state.error = false, payload.message

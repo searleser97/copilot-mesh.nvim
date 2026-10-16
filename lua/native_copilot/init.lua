@@ -2967,7 +2967,7 @@ function M._on_event(message)
   local payload = message.payload or {}
   if options.shared_host then
     if message.type == 'shared.reset' then
-      require('native_copilot.shared_history').reset()
+      require('native_copilot.shared_history').reset(payload.journalId)
       state.shared_cursor = 0
       state.shared_journal_id = payload.journalId
       for member_id in pairs(buffers.members()) do
