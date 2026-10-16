@@ -18,6 +18,7 @@ vim.ui.select = function(items, _, callback)
       callback(item) return
     end
   end
+  assert(not vim.env.MESH_TEST_SESSION_ID, 'Requested isolated conversation is absent')
   callback(items[2])
 end
 native.setup({
@@ -45,6 +46,11 @@ assert(vim.wait(30000, function()
   return member and table.concat(vim.api.nvim_buf_get_lines(member.views.conversation.buf, 0, -1, false), '\n')
     :find(vim.env.MESH_TEST_HISTORY or 'MESH_SHARED_OK', 1, true) ~= nil
 end, 50), 'shared history did not appear: ' .. table.concat(errors, '; '))
+if vim.env.MESH_TEST_TITLE then
+  local sidebar = vim.fn.bufnr('native-copilot://shared-chats')
+  assert(sidebar >= 0 and table.concat(vim.api.nvim_buf_get_lines(sidebar, 0, -1, false), '\n')
+    :find(vim.env.MESH_TEST_TITLE, 1, true), 'shared title missing from actual sidebar')
+end
 protocol.send('prompt.send', {
   target = target,
   content = 'Isolated editor connectivity test. Do not use tools. Reply with exactly ' .. reply .. '.',
@@ -66,6 +72,12 @@ assert(vim.wait(15000, function() return hello_count > previous_hello end, 50), 
 vim.wait(1000)
 local _, after = transcript():gsub(vim.pesc(reply), '')
 assert(before == after, 'bridge restart duplicated accepted transcript')
+if vim.env.MESH_TEST_REMOTE_REPLY then
+  vim.fn.writefile({ session_id }, assert(vim.env.MESH_TEST_READY_FILE))
+  assert(vim.wait(90000, function()
+    return transcript():find(vim.env.MESH_TEST_REMOTE_REPLY, 1, true) ~= nil
+  end, 50), 'third-client prompt did not reach attached editor')
+end
 protocol.stop_sync()
 print('PASS live shared editor attach/send/replay/bridge restart/detach SDK ' .. session_id)
 vim.cmd('qa!')
