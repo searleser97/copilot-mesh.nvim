@@ -18,11 +18,8 @@ const client = new SharedClient({
 let closed = false;
 let cursor = Number(process.env.MESH_SHARED_CURSOR ?? 0);
 let journalId = process.env.MESH_SHARED_JOURNAL_ID ?? "";
-let bootCursor = 0;
-let initialApprovals = new Set<string>();
 const cancellation = new AbortController();
 const requestIds = new Map<string, string>();
-const historyAcks = new Map<string, () => void>();
 const rpc = (command: IncomingCommand, method: SharedMethod, args: unknown[]) => {
   let id = requestIds.get(command.id);
   if (!id) { id = randomUUID(); requestIds.set(command.id, id); }
@@ -60,8 +57,43 @@ async function handle(command: IncomingCommand): Promise<void> {
   const complete = () => protocol.send("request.complete", { type: command.type }, { requestId: command.id, done: true });
   if (command.type === "shutdown") { detach(); return; }
   if (command.type === "history.chunk.rendered") {
-    historyAcks.get(`${p.replayId}:${p.chunkIndex}`)?.();
     complete(); return;
+  }
+  if (command.type === "shared.history") {
+    const memberId = field("target");
+    try {
+      const page = await client.history(memberId, typeof p.before === "number" ? p.before : undefined);
+      protocol.send("shared.history.page", { ...page, older: typeof p.before === "number" },
+        { memberId, requestId: command.id, done: true });
+    } catch (error) {
+      protocol.send("shared.history.error", { message: error instanceof Error ? error.message : String(error) },
+        { memberId, requestId: command.id, done: true });
+    }
+    return;
+  }
+  if (command.type === "shared.history.records") {
+    const memberId = field("target");
+    if (!Array.isArray(p.ids) || p.ids.some(id => typeof id !== "string")) throw new Error("Record IDs required.");
+    try {
+      const records = [];
+      for (const id of new Set(p.ids as string[])) records.push(await client.record(memberId, id));
+      protocol.send("shared.history.records", { records }, { memberId, requestId: command.id, done: true });
+    } catch (error) {
+      protocol.send("shared.history.error", { message: error instanceof Error ? error.message : String(error), live: true },
+        { memberId, requestId: command.id, done: true });
+    }
+    return;
+  }
+  if (command.type === "shared.history.content") {
+    const memberId = field("target");
+    try {
+      const chunk = await client.content(memberId, field("recordId"), Number(p.offset), Number(p.revision));
+      protocol.send("shared.history.content", { ...chunk, id: p.recordId }, { memberId, requestId: command.id, done: true });
+    } catch (error) {
+      protocol.send("shared.history.error", { message: error instanceof Error ? error.message : String(error), content: true },
+        { memberId, requestId: command.id, done: true });
+    }
+    return;
   }
   if (command.type === "hello" || command.type === "runtime.status") { await snapshot(command.id); return; }
   if (command.type === "state.snapshot") {
@@ -152,15 +184,12 @@ async function handle(command: IncomingCommand): Promise<void> {
 
 async function main() {
   const state = await client.snapshot();
-  bootCursor = state.cursor;
-  initialApprovals = new Set(state.approvals.map(e => e.type === "permission.requested" ? e.payload.requestId : ""));
   protocol.start();
   const reset = (current: typeof state) => {
-    cursor = 0;
-    bootCursor = current.cursor;
+    cursor = current.cursor;
     journalId = current.journalId;
-    initialApprovals = new Set(current.approvals.map(e => e.type === "permission.requested" ? e.payload.requestId : ""));
     protocol.send("shared.reset", { journalId });
+    for (const approval of current.approvals) sendCoreEvent(protocol, approval);
   };
   if (journalId !== state.journalId || !Number.isSafeInteger(cursor) || cursor < 0 || cursor > state.cursor) reset(state);
   protocol.send("shared.cursor", { cursor, journalId });
@@ -172,10 +201,12 @@ async function main() {
       if (disconnected) {
         const current = await snapshot();
         if (current.journalId !== journalId || cursor > current.cursor) reset(current);
+        protocol.send("shared.approvals", { approvals: current.approvals });
         protocol.send("shared.connection", { connected: true });
         disconnected = false;
       }
-      const batch = await client.events(cursor, cancellation.signal);
+      const batch = await client.updates(cursor, cancellation.signal);
+      const changes = new Map<string, Set<string>>();
       for (const entry of batch.events) {
         if (entry.sequence !== cursor + 1) {
           reset(await client.snapshot());
@@ -183,33 +214,20 @@ async function main() {
         }
         const event = entry.event;
         const fields = { sharedSequence: entry.sequence };
-        const historicalLifecycle = entry.sequence <= bootCursor && [
-          "primary.ready", "session.loading", "agent.loading", "agent.ready", "agent.stopped",
-        ].includes(event.type);
-        if (event.type === "permission.resolved") protocol.send(event.type, event.payload, fields);
+        if (event.type === "transcript.changed") {
+          const ids = changes.get(event.payload.target) ?? new Set<string>();
+          for (const id of event.payload.ids ?? []) ids.add(id);
+          changes.set(event.payload.target, ids);
+        } else if (event.type === "permission.resolved") protocol.send(event.type, event.payload, fields);
         else if (event.type === "host.catalog") {
           // The following snapshot updates this client's conversation list.
         } else if (event.type === "host.stopping" || event.type === "host.failed") {
           protocol.send("host.error", { message: `Shared ${event.type}; sessions are not owned by this editor.` });
-        } else if (event.type === "session.history") {
-          // SDK recovery can contain history committed immediately before host failure.
-          // Wait only for this client's renderer; the host already acknowledged ingestion.
-          await new Promise<void>((resolve, reject) => {
-            const key = `${event.payload.replayId}:${event.payload.chunkIndex}`;
-            const cleanup = () => {
-              historyAcks.delete(key);
-              cancellation.signal.removeEventListener("abort", abort);
-            };
-            const abort = () => { cleanup(); reject(new Error("Editor detached.")); };
-            historyAcks.set(key, () => { cleanup(); resolve(); });
-            cancellation.signal.addEventListener("abort", abort, { once: true });
-            sendCoreEvent({ send: (type, payload, context) => protocol.send(type, payload, { ...context, ...fields }) }, event);
-          });
-        } else if (!historicalLifecycle &&
-            !(event.type === "permission.requested" && entry.sequence <= bootCursor && !initialApprovals.has(event.payload.requestId))) {
-          if (event.type === "prompt.accepted") {
-            protocol.send("shared.user.message", event.payload, { ...event.context, ...fields });
-          } else sendCoreEvent({ send: (type, payload, context) => protocol.send(type, payload, { ...context, ...fields }) }, event as MeshEvent);
+        } else {
+          sendCoreEvent({ send: (type, payload, context) => protocol.send(type, payload, { ...context, ...fields }) }, event as MeshEvent);
+        }
+        for (const [target, ids] of changes) {
+          protocol.send("shared.history.changed", { ids: [...ids] }, { memberId: target });
         }
         cursor = entry.sequence;
       }

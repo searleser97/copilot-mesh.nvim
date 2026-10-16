@@ -2085,6 +2085,7 @@ function M.show_member(member_id, view_id)
   local view_buf = entry.views[view_id or 'conversation'].buf
   vim.api.nvim_win_set_buf(win, view_buf)
   buffers.on_shown(view_buf)
+  if options.shared_host then require('native_copilot.shared_history').shown(member_id) end
   buffers.mark_read(member_id)
   update_prompt_label()
   update_conversation_label(member_id)
@@ -2966,6 +2967,7 @@ function M._on_event(message)
   local payload = message.payload or {}
   if options.shared_host then
     if message.type == 'shared.reset' then
+      require('native_copilot.shared_history').reset()
       state.shared_cursor = 0
       state.shared_journal_id = payload.journalId
       for member_id in pairs(buffers.members()) do
@@ -2986,6 +2988,18 @@ function M._on_event(message)
     end
   end
   if message.type == 'session.color' then statusline.update(payload); return end
+  if options.shared_host and message.type:match('^shared%.history%.') then
+    require('native_copilot.shared_history').event(message)
+    return
+  end
+  if options.shared_host and message.type == 'shared.approvals' then
+    for _, pending in pairs(state.permission_pending) do pending.resolved = true end
+    state.permission_pending, state.permission_queue = {}, {}
+    for _, approval in ipairs(payload.approvals or {}) do
+      M._on_event(vim.tbl_extend('force', approval, approval.context or {}))
+    end
+    return
+  end
   if message.type == 'session.color.error' then
     notify(payload.message, vim.log.levels.ERROR)
     return
@@ -4026,6 +4040,7 @@ function M.setup(user_options)
     end
   end
   local group = vim.api.nvim_create_augroup('CopilotMesh', { clear = true })
+  if options.shared_host then require('native_copilot.shared_history').setup(send) end
   vim.api.nvim_create_autocmd('BufWinEnter', {
     group = group,
     callback = function(args) buffers.on_shown(args.buf) end,
@@ -4038,6 +4053,7 @@ function M.setup(user_options)
         win = vim.api.nvim_get_current_win()
       end
       buffers.on_view_moved(win, args.event)
+      if options.shared_host then require('native_copilot.shared_history').moved(win) end
     end,
   })
   vim.api.nvim_create_autocmd('TabClosed', {
