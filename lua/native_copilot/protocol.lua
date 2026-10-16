@@ -98,6 +98,8 @@ function M.start(opts, on_event)
     host_env.MESH_SHARED_URL = shared.url
     host_env.MESH_SHARED_TOKEN_FILE = shared.token_file
     host_env.MESH_TUNNEL_TOKEN_FILE = shared.tunnel_token_file or ''
+    host_env.MESH_SHARED_CURSOR = tostring(opts.shared_cursor or 0)
+    host_env.MESH_SHARED_JOURNAL_ID = opts.shared_journal_id or ''
   end
   state.job = vim.fn.jobstart(command, {
     cwd = opts.workspace or vim.uv.cwd(),

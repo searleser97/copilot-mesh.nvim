@@ -150,6 +150,8 @@ local state = {
   tool_calls = {},
   prompt_calls = {},
   shared_drafts = {},
+  shared_cursor = 0,
+  shared_journal_id = '',
   queued_prompts = {},
   prompt_queue_paused = {},
   prompt_queue_edit = nil,
@@ -2007,6 +2009,8 @@ local function start_host()
   return protocol.start({
     node_command = options.node_command,
     shared_host = options.shared_host,
+    shared_cursor = state.shared_cursor,
+    shared_journal_id = state.shared_journal_id,
     runtime_command_resolver = options.runtime_command_resolver,
     file_hook_directories = options.file_hook_directories,
     database_path = options.database_path,
@@ -2953,6 +2957,27 @@ end
 
 function M._on_event(message)
   local payload = message.payload or {}
+  if options.shared_host then
+    if message.type == 'shared.reset' then
+      state.shared_cursor = 0
+      state.shared_journal_id = payload.journalId
+      for member_id in pairs(buffers.members()) do
+        buffers.prepare_history(member_id)
+        buffers.finish_history_replay(member_id)
+      end
+      for _, pending in pairs(state.permission_pending) do pending.resolved = true end
+      state.permission_pending = {}
+      state.permission_queue = {}
+      return
+    elseif message.type == 'shared.cursor' then
+      state.shared_cursor = math.max(state.shared_cursor, payload.cursor)
+      state.shared_journal_id = payload.journalId
+      return
+    elseif message.sharedSequence then
+      if message.sharedSequence <= state.shared_cursor then return end
+      state.shared_cursor = message.sharedSequence
+    end
+  end
   if message.type == 'session.color' then statusline.update(payload); return end
   if message.type == 'session.color.error' then
     notify(payload.message, vim.log.levels.ERROR)

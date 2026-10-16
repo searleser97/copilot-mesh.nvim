@@ -16,7 +16,8 @@ const client = new SharedClient({
   ...(process.env.MESH_TUNNEL_TOKEN_FILE ? { tunnelToken: credential("MESH_TUNNEL_TOKEN_FILE")! } : {}),
 });
 let closed = false;
-let cursor = 0;
+let cursor = Number(process.env.MESH_SHARED_CURSOR ?? 0);
+let journalId = process.env.MESH_SHARED_JOURNAL_ID ?? "";
 let bootCursor = 0;
 let initialApprovals = new Set<string>();
 const cancellation = new AbortController();
@@ -90,6 +91,13 @@ async function handle(command: IncomingCommand): Promise<void> {
     protocol.send("shared.selected", created);
     complete(); return;
   }
+  if (command.type === "agents.spawn") {
+    const agents = await rpc(command, "spawnAgents", [{
+      agents: p.agents, callerCanTalkTo: p.callerCanTalkTo ?? [], callerCanObserve: p.callerCanObserve ?? [],
+    }]);
+    protocol.send("agents.spawned", { agents }, { requestId: command.id, done: true });
+    return;
+  }
   const simple: Record<string, { method: SharedMethod; args: unknown[] }> = {
     "prompt.send": { method: "sendUserPrompt", args: [p.target, p.content] },
     "session.abort": { method: "abort", args: [p.target] },
@@ -142,6 +150,15 @@ async function main() {
   bootCursor = state.cursor;
   initialApprovals = new Set(state.approvals.map(e => e.type === "permission.requested" ? e.payload.requestId : ""));
   protocol.start();
+  const reset = (current: typeof state) => {
+    cursor = 0;
+    bootCursor = current.cursor;
+    journalId = current.journalId;
+    initialApprovals = new Set(current.approvals.map(e => e.type === "permission.requested" ? e.payload.requestId : ""));
+    protocol.send("shared.reset", { journalId });
+  };
+  if (journalId !== state.journalId || !Number.isSafeInteger(cursor) || cursor < 0 || cursor > state.cursor) reset(state);
+  protocol.send("shared.cursor", { cursor, journalId });
   protocol.send("host.ready", { shared: true });
   await snapshot();
   let disconnected = false;
@@ -150,12 +167,16 @@ async function main() {
       const batch = await client.events(cursor, cancellation.signal);
       if (disconnected) { await snapshot(); protocol.send("shared.connection", { connected: true }); disconnected = false; }
       for (const entry of batch.events) {
-        if (entry.sequence !== cursor + 1) throw new Error("Event gap: detach and reconnect to replay history.");
+        if (entry.sequence !== cursor + 1) {
+          reset(await client.snapshot());
+          throw new Error("Event gap: rebuilding the local view.");
+        }
         const event = entry.event;
+        const fields = { sharedSequence: entry.sequence };
         const historicalLifecycle = entry.sequence <= bootCursor && [
           "primary.ready", "session.loading", "agent.loading", "agent.ready", "agent.stopped",
         ].includes(event.type);
-        if (event.type === "permission.resolved") protocol.send(event.type, event.payload);
+        if (event.type === "permission.resolved") protocol.send(event.type, event.payload, fields);
         else if (event.type === "host.catalog") {
           // The following snapshot updates this client's conversation list.
         } else if (event.type === "host.stopping" || event.type === "host.failed") {
@@ -163,14 +184,20 @@ async function main() {
         } else if (!historicalLifecycle && event.type !== "session.history" &&
             !(event.type === "permission.requested" && entry.sequence <= bootCursor && !initialApprovals.has(event.payload.requestId))) {
           if (event.type === "prompt.accepted") {
-            protocol.send("shared.user.message", event.payload, event.context);
-          } else sendCoreEvent(protocol, event as MeshEvent);
+            protocol.send("shared.user.message", event.payload, { ...event.context, ...fields });
+          } else sendCoreEvent({ send: (type, payload, context) => protocol.send(type, payload, { ...context, ...fields }) }, event as MeshEvent);
         }
         cursor = entry.sequence;
       }
-      catalog((await client.snapshot()).conversations);
-    } catch {
+      const current = await client.snapshot();
+      if (current.journalId !== journalId || cursor > current.cursor) reset(current);
+      protocol.send("shared.cursor", { cursor, journalId });
+      catalog(current.conversations);
+    } catch (error) {
       if (closed) break;
+      if (cursor > 0 && error instanceof Error && error.message.includes("HTTP 400")) {
+        reset(await client.snapshot());
+      }
       if (!disconnected) protocol.send("shared.connection", { connected: false,
         message: "Shared host disconnected. Retrying event catch-up; commands are not automatically resubmitted." });
       disconnected = true;

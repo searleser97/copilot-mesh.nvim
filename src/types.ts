@@ -12,6 +12,7 @@ export interface ProtocolMessage {
   memberId?: string;
   target?: string;
   sequence?: number;
+  sharedSequence?: number;
   done?: boolean;
   payload?: unknown;
 }
