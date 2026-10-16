@@ -11,6 +11,9 @@ The adapter embeds the separately packaged
 official `@github/copilot-sdk`, sessions, durable identities/ownership, mail and
 steering, observation, permission enforcement and SQLite recovery state.
 It is not a daemon: exiting Neovim shuts down the adapter and its SDK-owned processes.
+This remains the default. The separate, opt-in
+[shared-host development adapter](docs/shared-host.md) attaches to a background
+host without owning or stopping its sessions.
 
 ## Requirements
 

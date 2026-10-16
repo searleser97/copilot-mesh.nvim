@@ -145,9 +145,14 @@ local state = {
   command_requests = {},
   command_catalog_loaded = {},
   permission_queue = {},
+  permission_pending = {},
   permission_prompt_open = false,
   tool_calls = {},
   prompt_calls = {},
+  shared_drafts = {},
+  shared_cursor = 0,
+  shared_journal_id = '',
+  shared_titles = {},
   queued_prompts = {},
   prompt_queue_paused = {},
   prompt_queue_edit = nil,
@@ -447,6 +452,11 @@ update_prompt_label = function()
       '%@v:lua.NativeCopilotPromptVoiceToggle@[' .. voice_label .. ']%X'
   end
   if state.prompt_buf and vim.api.nvim_buf_is_valid(state.prompt_buf) then
+    local previous = vim.b[state.prompt_buf].native_copilot_target
+    if options.shared_host and previous and previous ~= state.selected then
+      state.shared_drafts[previous] = vim.api.nvim_buf_get_lines(state.prompt_buf, 0, -1, false)
+      vim.api.nvim_buf_set_lines(state.prompt_buf, 0, -1, false, state.shared_drafts[state.selected] or { '' })
+    end
     vim.b[state.prompt_buf].native_copilot_target = state.selected
   end
   vim.wo[state.prompt_win].winbar =
@@ -561,10 +571,10 @@ end
 
 local function dispatch_prompt(member_id, content)
   local entry = buffers.get_member(member_id)
-  local steering = entry
+  local steering = not options.shared_host and entry
     and entry.state == 'busy'
     and buffers.append_steering_prompt(member_id, content)
-  if not steering then
+  if not options.shared_host and not steering then
     buffers.append_block(member_id, 'conversation', 'You', content)
   end
   buffers.scroll_to_bottom(member_id)
@@ -1849,7 +1859,7 @@ local function close_non_prompt_windows()
       prompt_win = win
     elseif vim.api.nvim_win_get_buf(win) == state.prompt_queue_buf then
       prompt_queue_win = win
-    elseif not keep then
+    elseif not (options.shared_host and require('native_copilot.shared_sidebar').is_window(win)) and not keep then
       keep = win
     end
   end
@@ -1863,6 +1873,7 @@ local function close_non_prompt_windows()
       win ~= keep
       and win ~= prompt_win
       and win ~= prompt_queue_win
+      and not (options.shared_host and require('native_copilot.shared_sidebar').is_window(win))
       and vim.api.nvim_win_is_valid(win)
     then
       pcall(vim.api.nvim_win_close, win, true)
@@ -1985,6 +1996,17 @@ local function ensure_ui(reuse_current_tab)
   end
   update_prompt_label()
   refresh_prompt_queue()
+  if options.shared_host then
+    require('native_copilot.shared_sidebar').show(state.main_win, function(chat)
+      M.show_member(chat.target)
+    end, function() send('mode.primary') end, function(chat)
+      vim.ui.input({ prompt = 'Chat title: ', default = chat.displayName }, function(title)
+        if title and vim.trim(title) ~= '' then
+          send('shared.rename', { target = chat.target, title = vim.trim(title) })
+        end
+      end)
+    end)
+  end
   vim.api.nvim_set_current_win(state.prompt_win)
   prewarm_voice()
 end
@@ -1993,6 +2015,9 @@ local function start_host()
   if protocol.is_running() then return true end
   return protocol.start({
     node_command = options.node_command,
+    shared_host = options.shared_host,
+    shared_cursor = state.shared_cursor,
+    shared_journal_id = state.shared_journal_id,
     runtime_command_resolver = options.runtime_command_resolver,
     file_hook_directories = options.file_hook_directories,
     database_path = options.database_path,
@@ -2387,10 +2412,13 @@ local function show_next_permission()
     format_item = function(item) return item.display end,
   }, function(item)
     local approved = item ~= nil and item.approved == true
-    send('permission.respond', {
-      requestId = pending.requestId,
-      approved = approved,
-    })
+    if not pending.resolved then
+      send('permission.respond', {
+        requestId = pending.requestId,
+        approved = approved,
+      })
+    end
+    state.permission_pending[pending.requestId] = nil
     buffers.remove_timeline(pending.member_id, pending.timeline_id)
     state.permission_prompt_open = false
     vim.schedule(show_next_permission)
@@ -2406,6 +2434,7 @@ local function request_permission(payload, member_id)
     detail = tostring(permission_detail(request)),
   })
   table.insert(state.permission_queue, pending)
+  state.permission_pending[pending.requestId] = pending
   buffers.upsert_timeline(member_id, pending.timeline_id, {
     kind = 'permission',
     label = pending.kind,
@@ -2557,7 +2586,16 @@ function M.select_agents()
   end
   picker('Copilot agents', entries, function(item)
     if item.kind == 'stop' then
-      send('agent.stop', { target = item.target })
+      if options.shared_host then
+        vim.ui.select({ 'Keep running', 'Stop for all clients' },
+          { prompt = 'Stop session and cancel current work? History is preserved.' }, function(choice)
+            if choice == 'Stop for all clients' then
+              send('agent.stop', { target = item.target, confirmBusy = true })
+            end
+          end)
+      else
+        send('agent.stop', { target = item.target })
+      end
       return
     end
     if item.kind == 'recover' then
@@ -2926,6 +2964,27 @@ end
 
 function M._on_event(message)
   local payload = message.payload or {}
+  if options.shared_host then
+    if message.type == 'shared.reset' then
+      state.shared_cursor = 0
+      state.shared_journal_id = payload.journalId
+      for member_id in pairs(buffers.members()) do
+        buffers.prepare_history(member_id)
+        buffers.finish_history_replay(member_id)
+      end
+      for _, pending in pairs(state.permission_pending) do pending.resolved = true end
+      state.permission_pending = {}
+      state.permission_queue = {}
+      return
+    elseif message.type == 'shared.cursor' then
+      state.shared_cursor = math.max(state.shared_cursor, payload.cursor)
+      state.shared_journal_id = payload.journalId
+      return
+    elseif message.sharedSequence then
+      if message.sharedSequence <= state.shared_cursor then return end
+      state.shared_cursor = message.sharedSequence
+    end
+  end
   if message.type == 'session.color' then statusline.update(payload); return end
   if message.type == 'session.color.error' then
     notify(payload.message, vim.log.levels.ERROR)
@@ -2935,8 +2994,45 @@ function M._on_event(message)
     or message.type == 'session.loading'
     or (message.type == 'agent.loading' and payload.primary)
   then statusline.clear() end
+  if message.type == 'shared.connection' then
+    notify(payload.message or 'Shared host reconnected.', payload.connected and vim.log.levels.INFO or vim.log.levels.WARN)
+    return
+  elseif message.type == 'shared.catalog' then
+    if options.shared_host then
+      for _, chat in ipairs(payload.conversations or {}) do
+        state.shared_titles[chat.target] = chat.displayName
+        if buffers.get_member(chat.target) then buffers.ensure_member(chat.target, chat.displayName) end
+      end
+      require('native_copilot.shared_sidebar').update(payload.conversations or {})
+      update_prompt_label()
+    end
+    return
+  elseif message.type == 'shared.selected' then
+    if payload.target and buffers.get_member(payload.target) then
+      state.startup_request_id = nil
+      state.loading_target = nil
+      stop_loading_animation()
+      state.selected = payload.target
+      reveal_loading_member(payload.target)
+      M.show_member(payload.target)
+      restore_resume_cursor_animation(100)
+    end
+    return
+  elseif message.type == 'permission.resolved' then
+    local pending = state.permission_pending[payload.requestId]
+    if pending then
+      pending.resolved = true
+      buffers.remove_timeline(pending.member_id, pending.timeline_id)
+      state.permission_queue = vim.tbl_filter(function(item) return item ~= pending end, state.permission_queue)
+      notify(payload.applied == false and ('Permission not applied: ' .. (payload.error or 'request cancelled'))
+        or 'Permission resolved by a connected client.',
+        payload.applied == false and vim.log.levels.WARN or vim.log.levels.INFO)
+    end
+    return
+  end
   if message.type == 'request.complete' and message.requestId then
     state.startup_requests[message.requestId] = nil
+    if options.shared_host then state.prompt_calls[message.requestId] = nil end
   end
   if message.type == 'host.error' then
     state.startup_request_id = nil
@@ -2950,7 +3046,6 @@ function M._on_event(message)
     or message.type == 'host.shutdown'
     or message.type == 'runtime.ready'
     or message.type == 'request.complete'
-    or message.type == 'permission.resolved'
     or message.type == 'agents.spawned'
     or message.type == 'state.snapshot'
     or message.type == 'runtime.status'
@@ -2971,6 +3066,7 @@ function M._on_event(message)
     for _, agent in ipairs(status.agents or {}) do
       local target = agent.target or agent.id
       if target then
+        if options.shared_host and state.shared_titles[target] then agent.displayName = state.shared_titles[target] end
         if agent.primary or agent.agentId == status.primaryAgentId then set_primary(agent) end
         reported_agents[target] = true
         state.agents[target] = vim.deepcopy(agent)
@@ -2981,10 +3077,14 @@ function M._on_event(message)
     end
     for target in pairs(state.agents) do
       if not reported_agents[target] then
-        reset_member(target)
-        remove_from_order(target)
+        if options.shared_host then
+          buffers.set_state(target, 'stopped')
+        else
+          reset_member(target)
+          remove_from_order(target)
+        end
         state.agents[target] = nil
-        if state.selected == target then state.selected = fallback_member() end
+        if not options.shared_host and state.selected == target then state.selected = fallback_member() end
       end
     end
     for _, agent in ipairs(status.agents or {}) do
@@ -3014,7 +3114,7 @@ function M._on_event(message)
     if startup then
       state.startup_requests[message.requestId] = nil
       if message.requestId ~= state.startup_request_id or not is_ui_open() then return end
-      if state.primary_target and state.mode ~= 'stopped' then
+      if not options.shared_host and state.primary_target and state.mode ~= 'stopped' then
         state.startup_request_id = nil
         return
       end
@@ -3642,15 +3742,20 @@ function M._on_event(message)
   elseif message.type == 'agent.stopped' then
     local target = payload.target
     if not target then return end
-    reset_member(target)
-    remove_from_order(target)
+    if options.shared_host then
+      buffers.set_state(target, 'stopped')
+      buffers.append_activity_block(target, 'Stopped', 'Session stopped for all clients. History is preserved.')
+    else
+      reset_member(target)
+      remove_from_order(target)
+    end
     state.agents[target] = nil
     if target == state.primary_target then
       state.primary_target = nil
       state.primary_agent_id = nil
       state.mode = 'stopped'
     end
-    if state.selected == target then state.selected = fallback_member() end
+    if not options.shared_host and state.selected == target then state.selected = fallback_member() end
     if not buffers.get_member(state.selected) then state.selected = fallback_member() end
     if is_ui_open() and buffers.get_member(state.selected) then refresh_member(state.selected) end
     return
@@ -3704,6 +3809,8 @@ function M._on_event(message)
     if loading_visible() and (not state.loading_target or state.loading_target == member_id) then
       set_loading_stage(payload.message or 'Loading Copilot Mesh', member_id)
     end
+  elseif message.type == 'shared.user.message' then
+    buffers.append_block(member_id, 'conversation', 'You', payload.content or '')
   elseif message.type == 'session.history' then
     enqueue_history_render(member_id, payload)
   elseif message.type == 'scheduled.prompt' then
