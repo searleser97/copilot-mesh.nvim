@@ -145,6 +145,7 @@ local state = {
   command_requests = {},
   command_catalog_loaded = {},
   permission_queue = {},
+  permission_pending = {},
   permission_prompt_open = false,
   tool_calls = {},
   prompt_calls = {},
@@ -2388,10 +2389,13 @@ local function show_next_permission()
     format_item = function(item) return item.display end,
   }, function(item)
     local approved = item ~= nil and item.approved == true
-    send('permission.respond', {
-      requestId = pending.requestId,
-      approved = approved,
-    })
+    if not pending.resolved then
+      send('permission.respond', {
+        requestId = pending.requestId,
+        approved = approved,
+      })
+    end
+    state.permission_pending[pending.requestId] = nil
     buffers.remove_timeline(pending.member_id, pending.timeline_id)
     state.permission_prompt_open = false
     vim.schedule(show_next_permission)
@@ -2407,6 +2411,7 @@ local function request_permission(payload, member_id)
     detail = tostring(permission_detail(request)),
   })
   table.insert(state.permission_queue, pending)
+  state.permission_pending[pending.requestId] = pending
   buffers.upsert_timeline(member_id, pending.timeline_id, {
     kind = 'permission',
     label = pending.kind,
@@ -2558,7 +2563,16 @@ function M.select_agents()
   end
   picker('Copilot agents', entries, function(item)
     if item.kind == 'stop' then
-      send('agent.stop', { target = item.target })
+      if options.shared_host then
+        vim.ui.select({ 'Keep running', 'Stop for all clients' },
+          { prompt = 'Stop session and cancel current work? History is preserved.' }, function(choice)
+            if choice == 'Stop for all clients' then
+              send('agent.stop', { target = item.target, confirmBusy = true })
+            end
+          end)
+      else
+        send('agent.stop', { target = item.target })
+      end
       return
     end
     if item.kind == 'recover' then
@@ -2941,8 +2955,22 @@ function M._on_event(message)
     return
   elseif message.type == 'shared.selected' then
     if payload.target and buffers.get_member(payload.target) then
+      state.startup_request_id = nil
+      state.loading_target = nil
+      stop_loading_animation()
       state.selected = payload.target
+      reveal_loading_member(payload.target)
       M.show_member(payload.target)
+      restore_resume_cursor_animation(100)
+    end
+    return
+  elseif message.type == 'permission.resolved' then
+    local pending = state.permission_pending[payload.requestId]
+    if pending then
+      pending.resolved = true
+      buffers.remove_timeline(pending.member_id, pending.timeline_id)
+      state.permission_queue = vim.tbl_filter(function(item) return item ~= pending end, state.permission_queue)
+      notify('Permission resolved by a connected client.', vim.log.levels.INFO)
     end
     return
   end
@@ -2962,7 +2990,6 @@ function M._on_event(message)
     or message.type == 'host.shutdown'
     or message.type == 'runtime.ready'
     or message.type == 'request.complete'
-    or message.type == 'permission.resolved'
     or message.type == 'agents.spawned'
     or message.type == 'state.snapshot'
     or message.type == 'runtime.status'
@@ -2993,10 +3020,14 @@ function M._on_event(message)
     end
     for target in pairs(state.agents) do
       if not reported_agents[target] then
-        reset_member(target)
-        remove_from_order(target)
+        if options.shared_host then
+          buffers.set_state(target, 'stopped')
+        else
+          reset_member(target)
+          remove_from_order(target)
+        end
         state.agents[target] = nil
-        if state.selected == target then state.selected = fallback_member() end
+        if not options.shared_host and state.selected == target then state.selected = fallback_member() end
       end
     end
     for _, agent in ipairs(status.agents or {}) do
@@ -3026,7 +3057,7 @@ function M._on_event(message)
     if startup then
       state.startup_requests[message.requestId] = nil
       if message.requestId ~= state.startup_request_id or not is_ui_open() then return end
-      if state.primary_target and state.mode ~= 'stopped' then
+      if not options.shared_host and state.primary_target and state.mode ~= 'stopped' then
         state.startup_request_id = nil
         return
       end
@@ -3654,15 +3685,20 @@ function M._on_event(message)
   elseif message.type == 'agent.stopped' then
     local target = payload.target
     if not target then return end
-    reset_member(target)
-    remove_from_order(target)
+    if options.shared_host then
+      buffers.set_state(target, 'stopped')
+      buffers.append_activity_block(target, 'Stopped', 'Session stopped for all clients. History is preserved.')
+    else
+      reset_member(target)
+      remove_from_order(target)
+    end
     state.agents[target] = nil
     if target == state.primary_target then
       state.primary_target = nil
       state.primary_agent_id = nil
       state.mode = 'stopped'
     end
-    if state.selected == target then state.selected = fallback_member() end
+    if not options.shared_host and state.selected == target then state.selected = fallback_member() end
     if not buffers.get_member(state.selected) then state.selected = fallback_member() end
     if is_ui_open() and buffers.get_member(state.selected) then refresh_member(state.selected) end
     return

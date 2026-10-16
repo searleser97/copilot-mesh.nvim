@@ -76,8 +76,10 @@ async function handle(command: IncomingCommand): Promise<void> {
     complete(); return;
   }
   if (command.type === "mode.primary") {
-    await rpc(command, "createConversation", []);
-    await snapshot(); complete(); return;
+    const created = await rpc(command, "createConversation", []);
+    await snapshot();
+    protocol.send("shared.selected", created);
+    complete(); return;
   }
   const simple: Record<string, { method: SharedMethod; args: unknown[] }> = {
     "prompt.send": { method: "sendUserPrompt", args: [p.target, p.content] },
@@ -132,6 +134,7 @@ async function main() {
   initialApprovals = new Set(state.approvals.map(e => e.type === "permission.requested" ? e.payload.requestId : ""));
   protocol.start();
   protocol.send("host.ready", { shared: true });
+  await snapshot();
   let disconnected = false;
   while (!closed) {
     try {
@@ -140,10 +143,13 @@ async function main() {
       for (const entry of batch.events) {
         if (entry.sequence !== cursor + 1) throw new Error("Event gap: detach and reconnect to replay history.");
         const event = entry.event;
+        const historicalLifecycle = entry.sequence <= bootCursor && [
+          "primary.ready", "session.loading", "agent.loading", "agent.ready", "agent.stopped",
+        ].includes(event.type);
         if (event.type === "permission.resolved") protocol.send(event.type, event.payload);
         else if (event.type === "host.stopping" || event.type === "host.failed") {
           protocol.send("host.error", { message: `Shared ${event.type}; sessions are not owned by this editor.` });
-        } else if (event.type !== "session.history" &&
+        } else if (!historicalLifecycle && event.type !== "session.history" &&
             !(event.type === "permission.requested" && entry.sequence <= bootCursor && !initialApprovals.has(event.payload.requestId))) {
           if (event.type === "prompt.accepted") {
             protocol.send("shared.user.message", event.payload, event.context);
