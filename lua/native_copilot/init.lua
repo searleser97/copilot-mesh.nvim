@@ -561,10 +561,10 @@ end
 
 local function dispatch_prompt(member_id, content)
   local entry = buffers.get_member(member_id)
-  local steering = entry
+  local steering = not options.shared_host and entry
     and entry.state == 'busy'
     and buffers.append_steering_prompt(member_id, content)
-  if not steering then
+  if not options.shared_host and not steering then
     buffers.append_block(member_id, 'conversation', 'You', content)
   end
   buffers.scroll_to_bottom(member_id)
@@ -1993,6 +1993,7 @@ local function start_host()
   if protocol.is_running() then return true end
   return protocol.start({
     node_command = options.node_command,
+    shared_host = options.shared_host,
     runtime_command_resolver = options.runtime_command_resolver,
     file_hook_directories = options.file_hook_directories,
     database_path = options.database_path,
@@ -2935,8 +2936,19 @@ function M._on_event(message)
     or message.type == 'session.loading'
     or (message.type == 'agent.loading' and payload.primary)
   then statusline.clear() end
+  if message.type == 'shared.connection' then
+    notify(payload.message or 'Shared host reconnected.', payload.connected and vim.log.levels.INFO or vim.log.levels.WARN)
+    return
+  elseif message.type == 'shared.selected' then
+    if payload.target and buffers.get_member(payload.target) then
+      state.selected = payload.target
+      M.show_member(payload.target)
+    end
+    return
+  end
   if message.type == 'request.complete' and message.requestId then
     state.startup_requests[message.requestId] = nil
+    if options.shared_host then state.prompt_calls[message.requestId] = nil end
   end
   if message.type == 'host.error' then
     state.startup_request_id = nil
@@ -3704,6 +3716,8 @@ function M._on_event(message)
     if loading_visible() and (not state.loading_target or state.loading_target == member_id) then
       set_loading_stage(payload.message or 'Loading Copilot Mesh', member_id)
     end
+  elseif message.type == 'shared.user.message' then
+    buffers.append_block(member_id, 'conversation', 'You', payload.content or '')
   elseif message.type == 'session.history' then
     enqueue_history_render(member_id, payload)
   elseif message.type == 'scheduled.prompt' then

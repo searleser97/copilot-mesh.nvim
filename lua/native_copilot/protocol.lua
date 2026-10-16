@@ -67,7 +67,8 @@ function M.start(opts, on_event)
     return true
   end
 
-  local host = plugin_root() .. '/dist/main.js'
+  local shared = opts.shared_host
+  local host = plugin_root() .. (shared and '/dist/shared-main.js' or '/dist/main.js')
   if vim.fn.filereadable(host) ~= 1 then
     vim.notify(
       'Copilot Mesh host is not built. Run npm install && npm run build in ' .. plugin_root(),
@@ -92,6 +93,11 @@ function M.start(opts, on_event)
   }
   if opts.runtime_command_resolver then
     host_env.NATIVE_COPILOT_RUNTIME_COMMAND_RESOLVER = opts.runtime_command_resolver
+  end
+  if shared then
+    host_env.MESH_SHARED_URL = shared.url
+    host_env.MESH_SHARED_TOKEN_FILE = shared.token_file
+    host_env.MESH_TUNNEL_TOKEN_FILE = shared.tunnel_token_file or ''
   end
   state.job = vim.fn.jobstart(command, {
     cwd = opts.workspace or vim.uv.cwd(),

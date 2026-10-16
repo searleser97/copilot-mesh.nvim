@@ -18,6 +18,7 @@ export class Protocol {
   constructor(
     private readonly onCommand: (command: IncomingCommand) => Promise<void>,
     private readonly onEof: () => Promise<void>,
+    private readonly parallelCommands: readonly string[] = [],
   ) {
     this.input = createInterface({ input: stdin, crlfDelay: Infinity });
   }
@@ -26,7 +27,8 @@ export class Protocol {
     this.input.on("line", (line) => {
       try {
         const parsed = JSON.parse(line) as { type?: unknown };
-        if (parsed.type === "history.chunk.rendered") {
+        if (parsed.type === "history.chunk.rendered" ||
+            (typeof parsed.type === "string" && this.parallelCommands.includes(parsed.type))) {
           void this.handleLine(line);
           return;
         }
