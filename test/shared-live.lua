@@ -23,7 +23,8 @@ vim.ui.select = function(items, _, callback)
 end
 native.setup({
   voice = { preload = false }, session_colors = { enabled = false },
-  shared_host = { url = vim.env.MESH_SHARED_URL, token_file = vim.env.MESH_SHARED_TOKEN_FILE },
+  shared_host = { url = vim.env.MESH_SHARED_URL, token_file = vim.env.MESH_SHARED_TOKEN_FILE,
+    tunnel_token_file = vim.env.MESH_TUNNEL_TOKEN_FILE },
 })
 local on_event = native._on_event
 native._on_event = function(event)

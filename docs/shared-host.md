@@ -53,7 +53,9 @@ owns SDK acknowledgement and continues independently.
 
 `test/shared-live.lua` is an opt-in real-host smoke test. Run it only with isolated
 Neovim config/data/state/cache, `-u NONE -i NONE`, `MESH_SHARED_URL`, and a private
-`MESH_SHARED_TOKEN_FILE`. `MESH_TEST_SESSION_ID` selects an existing synthetic
+`MESH_SHARED_TOKEN_FILE`. For a private HTTPS tunnel, also set
+`MESH_TUNNEL_TOKEN_FILE` to its private connect-token file.
+`MESH_TEST_SESSION_ID` selects an existing synthetic
 conversation, `MESH_TEST_HISTORY` identifies expected history, and
 `MESH_TEST_REPLY` supplies a unique response marker. `MESH_TEST_TITLE` checks the
 actual sidebar. The test sends a harmless prompt and restarts only its transport
