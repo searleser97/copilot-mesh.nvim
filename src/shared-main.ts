@@ -70,7 +70,7 @@ async function handle(command: IncomingCommand): Promise<void> {
   if (command.type === "sessions.list") {
     const state = await client.snapshot();
     const sessions = state.conversations.map(s => {
-      return { ...s, summary: `${s.live ? "[Attach live]" : "[Resume stopped]"} ${s.displayName}`,
+      return { ...s, summary: `${s.live ? "[Attach live]" : "[Resume stopped]"} ${s.displayName}${s.primary ? " (host primary)" : ""}`,
         inUse: false, modifiedAgoSeconds: 0 };
     });
     protocol.send("sessions.list", { sessions }, { requestId: command.id, done: true }); return;
