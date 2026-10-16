@@ -26,6 +26,11 @@ testing. The token files are read by the adapter; contents never enter argv or
 the event log. Each connection replays the shared durable journal before following
 live events. Existing live sessions are attachable, not "in use elsewhere".
 Selecting a stopped managed session explicitly resumes it.
+Shared mode adds a left sidebar of running hosted human conversations. Enter
+selects a chat locally; `n` creates one. Subordinate agents remain accessible through
+the existing agent picker/overview and are not conflated with inbox conversations.
+Stopped conversations remain available in the session picker. The embedded layout
+does not change. Shared-mode drafts are retained separately for each selected chat.
 
 Prompts are rendered from shared acceptance events rather than optimistic local
 echo, so other clients see them without duplicate local messages. Drafts, folds,

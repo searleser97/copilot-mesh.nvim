@@ -27,6 +27,14 @@ const rpc = (command: IncomingCommand, method: SharedMethod, args: unknown[]) =>
   return client.command(method, args, id);
 };
 const protocol = new Protocol(handle, async () => detach(), ["permission.respond", "session.abort"]);
+let catalogSignature = "";
+const catalog = (conversations: Awaited<ReturnType<SharedClient["snapshot"]>>["conversations"]) => {
+  const signature = JSON.stringify(conversations);
+  if (signature !== catalogSignature) {
+    catalogSignature = signature;
+    protocol.send("shared.catalog", { conversations });
+  }
+};
 function detach() {
   closed = true;
   cancellation.abort();
@@ -34,6 +42,7 @@ function detach() {
 }
 const snapshot = async (requestId?: string) => {
   const state = await client.snapshot();
+  catalog(state.conversations);
   protocol.send("hello", { shared: true, status: state.status,
     recoverableAgents: state.state.runs.filter(run => run.status !== "active") },
   requestId ? { requestId, done: true } : {});
@@ -147,7 +156,9 @@ async function main() {
           "primary.ready", "session.loading", "agent.loading", "agent.ready", "agent.stopped",
         ].includes(event.type);
         if (event.type === "permission.resolved") protocol.send(event.type, event.payload);
-        else if (event.type === "host.stopping" || event.type === "host.failed") {
+        else if (event.type === "host.catalog") {
+          // The following snapshot updates this client's conversation list.
+        } else if (event.type === "host.stopping" || event.type === "host.failed") {
           protocol.send("host.error", { message: `Shared ${event.type}; sessions are not owned by this editor.` });
         } else if (!historicalLifecycle && event.type !== "session.history" &&
             !(event.type === "permission.requested" && entry.sequence <= bootCursor && !initialApprovals.has(event.payload.requestId))) {
@@ -157,6 +168,7 @@ async function main() {
         }
         cursor = entry.sequence;
       }
+      catalog((await client.snapshot()).conversations);
     } catch {
       if (closed) break;
       if (!disconnected) protocol.send("shared.connection", { connected: false,

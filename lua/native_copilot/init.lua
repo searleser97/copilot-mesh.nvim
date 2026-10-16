@@ -149,6 +149,7 @@ local state = {
   permission_prompt_open = false,
   tool_calls = {},
   prompt_calls = {},
+  shared_drafts = {},
   queued_prompts = {},
   prompt_queue_paused = {},
   prompt_queue_edit = nil,
@@ -448,6 +449,11 @@ update_prompt_label = function()
       '%@v:lua.NativeCopilotPromptVoiceToggle@[' .. voice_label .. ']%X'
   end
   if state.prompt_buf and vim.api.nvim_buf_is_valid(state.prompt_buf) then
+    local previous = vim.b[state.prompt_buf].native_copilot_target
+    if options.shared_host and previous and previous ~= state.selected then
+      state.shared_drafts[previous] = vim.api.nvim_buf_get_lines(state.prompt_buf, 0, -1, false)
+      vim.api.nvim_buf_set_lines(state.prompt_buf, 0, -1, false, state.shared_drafts[state.selected] or { '' })
+    end
     vim.b[state.prompt_buf].native_copilot_target = state.selected
   end
   vim.wo[state.prompt_win].winbar =
@@ -1850,7 +1856,7 @@ local function close_non_prompt_windows()
       prompt_win = win
     elseif vim.api.nvim_win_get_buf(win) == state.prompt_queue_buf then
       prompt_queue_win = win
-    elseif not keep then
+    elseif not (options.shared_host and require('native_copilot.shared_sidebar').is_window(win)) and not keep then
       keep = win
     end
   end
@@ -1864,6 +1870,7 @@ local function close_non_prompt_windows()
       win ~= keep
       and win ~= prompt_win
       and win ~= prompt_queue_win
+      and not (options.shared_host and require('native_copilot.shared_sidebar').is_window(win))
       and vim.api.nvim_win_is_valid(win)
     then
       pcall(vim.api.nvim_win_close, win, true)
@@ -1986,6 +1993,11 @@ local function ensure_ui(reuse_current_tab)
   end
   update_prompt_label()
   refresh_prompt_queue()
+  if options.shared_host then
+    require('native_copilot.shared_sidebar').show(state.main_win, function(chat)
+      M.show_member(chat.target)
+    end, function() send('mode.primary') end)
+  end
   vim.api.nvim_set_current_win(state.prompt_win)
   prewarm_voice()
 end
@@ -2953,6 +2965,11 @@ function M._on_event(message)
   if message.type == 'shared.connection' then
     notify(payload.message or 'Shared host reconnected.', payload.connected and vim.log.levels.INFO or vim.log.levels.WARN)
     return
+  elseif message.type == 'shared.catalog' then
+    if options.shared_host then
+      require('native_copilot.shared_sidebar').update(payload.conversations or {})
+    end
+    return
   elseif message.type == 'shared.selected' then
     if payload.target and buffers.get_member(payload.target) then
       state.startup_request_id = nil
@@ -2970,7 +2987,9 @@ function M._on_event(message)
       pending.resolved = true
       buffers.remove_timeline(pending.member_id, pending.timeline_id)
       state.permission_queue = vim.tbl_filter(function(item) return item ~= pending end, state.permission_queue)
-      notify('Permission resolved by a connected client.', vim.log.levels.INFO)
+      notify(payload.applied == false and ('Permission not applied: ' .. (payload.error or 'request cancelled'))
+        or 'Permission resolved by a connected client.',
+        payload.applied == false and vim.log.levels.WARN or vim.log.levels.INFO)
     end
     return
   end
