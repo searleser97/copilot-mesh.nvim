@@ -22,6 +22,7 @@ let bootCursor = 0;
 let initialApprovals = new Set<string>();
 const cancellation = new AbortController();
 const requestIds = new Map<string, string>();
+const historyAcks = new Map<string, () => void>();
 const rpc = (command: IncomingCommand, method: SharedMethod, args: unknown[]) => {
   let id = requestIds.get(command.id);
   if (!id) { id = randomUUID(); requestIds.set(command.id, id); }
@@ -58,7 +59,10 @@ async function handle(command: IncomingCommand): Promise<void> {
   };
   const complete = () => protocol.send("request.complete", { type: command.type }, { requestId: command.id, done: true });
   if (command.type === "shutdown") { detach(); return; }
-  if (command.type === "history.chunk.rendered") { complete(); return; }
+  if (command.type === "history.chunk.rendered") {
+    historyAcks.get(`${p.replayId}:${p.chunkIndex}`)?.();
+    complete(); return;
+  }
   if (command.type === "hello" || command.type === "runtime.status") { await snapshot(command.id); return; }
   if (command.type === "state.snapshot") {
     protocol.send("state.snapshot", (await client.snapshot()).state, { requestId: command.id, done: true }); return;
@@ -165,8 +169,13 @@ async function main() {
   let disconnected = false;
   while (!closed) {
     try {
+      if (disconnected) {
+        const current = await snapshot();
+        if (current.journalId !== journalId || cursor > current.cursor) reset(current);
+        protocol.send("shared.connection", { connected: true });
+        disconnected = false;
+      }
       const batch = await client.events(cursor, cancellation.signal);
-      if (disconnected) { await snapshot(); protocol.send("shared.connection", { connected: true }); disconnected = false; }
       for (const entry of batch.events) {
         if (entry.sequence !== cursor + 1) {
           reset(await client.snapshot());
@@ -182,7 +191,21 @@ async function main() {
           // The following snapshot updates this client's conversation list.
         } else if (event.type === "host.stopping" || event.type === "host.failed") {
           protocol.send("host.error", { message: `Shared ${event.type}; sessions are not owned by this editor.` });
-        } else if (!historicalLifecycle && event.type !== "session.history" &&
+        } else if (event.type === "session.history") {
+          // SDK recovery can contain history committed immediately before host failure.
+          // Wait only for this client's renderer; the host already acknowledged ingestion.
+          await new Promise<void>((resolve, reject) => {
+            const key = `${event.payload.replayId}:${event.payload.chunkIndex}`;
+            const cleanup = () => {
+              historyAcks.delete(key);
+              cancellation.signal.removeEventListener("abort", abort);
+            };
+            const abort = () => { cleanup(); reject(new Error("Editor detached.")); };
+            historyAcks.set(key, () => { cleanup(); resolve(); });
+            cancellation.signal.addEventListener("abort", abort, { once: true });
+            sendCoreEvent({ send: (type, payload, context) => protocol.send(type, payload, { ...context, ...fields }) }, event);
+          });
+        } else if (!historicalLifecycle &&
             !(event.type === "permission.requested" && entry.sequence <= bootCursor && !initialApprovals.has(event.payload.requestId))) {
           if (event.type === "prompt.accepted") {
             protocol.send("shared.user.message", event.payload, { ...event.context, ...fields });
@@ -197,7 +220,8 @@ async function main() {
     } catch (error) {
       if (closed) break;
       if (cursor > 0 && error instanceof Error && error.message.includes("HTTP 400")) {
-        reset(await client.snapshot());
+        cursor = 0;
+        journalId = "";
       }
       if (!disconnected) protocol.send("shared.connection", { connected: false,
         message: "Shared host disconnected. Retrying event catch-up; commands are not automatically resubmitted." });
